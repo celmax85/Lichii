@@ -852,6 +852,7 @@ void Scheduler::EndPendingOperations() {
     EndRenderPass();
 }
 
+/// Finish the active render pass and invalidate recorded binds that do not survive it.
 void Scheduler::EndRenderPass()
     {
         RealizeDeferredClear();
