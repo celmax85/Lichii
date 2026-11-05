@@ -36,6 +36,10 @@ void LayerPass(IR::Program& program, const HostTranslateInfo& host_info);
 void VendorWorkaroundPass(IR::Program& program);
 void VerificationPass(const IR::Program& program);
 bool HasBrokenPattern(const IR::Program& program);
+/// EDEN_NX2_DYN_CBUF_POINTERS=1 (off by default, read once): native global accesses whose base
+/// pointer is read from a constant buffer at a dynamic offset bind every pointer of that buffer,
+/// instead of upstream's slot walk.
+bool NativeDynamicCbufPointers();
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);
