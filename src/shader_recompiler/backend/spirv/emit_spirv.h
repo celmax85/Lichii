@@ -33,13 +33,21 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
-// Base addresses (u64) of a native compute program's native_indirect storage buffers, after the
-// rescaling and render area words.
+// Base addresses (u64) of a native program's native_indirect storage buffers, after the
+// rescaling and render area words: a compute program's 8, or a draw's task program's 4 followed by
+// its mesh program's 4 (Info::MaxNativeIndirectBindings).
 constexpr u32 NATIVE_INDIRECT_BASES_OFFSET = 64;
 constexpr u32 NATIVE_INDIRECT_BASES_SIZE = 8 * sizeof(u64);
 static_assert(NATIVE_INDIRECT_BASES_OFFSET >= sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
 // Within the 128 bytes of push constants every Vulkan device supports
 static_assert(NATIVE_INDIRECT_BASES_OFFSET + NATIVE_INDIRECT_BASES_SIZE <= 128);
+static_assert(2 * Info::MAX_NATIVE_INDIRECT_GRAPHICS_BINDINGS * sizeof(u64) <=
+              NATIVE_INDIRECT_BASES_SIZE);
+/// The first of a stage's bases in the NATIVE_INDIRECT_BASES_SIZE bytes, in u64 units
+constexpr u32 NativeIndirectBasesFirst(Stage stage) {
+    return stage == Stage::Mesh ? static_cast<u32>(Info::MAX_NATIVE_INDIRECT_GRAPHICS_BINDINGS)
+                                : 0U;
+}
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;

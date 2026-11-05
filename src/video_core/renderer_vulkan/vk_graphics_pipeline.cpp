@@ -313,6 +313,12 @@ GraphicsPipeline::GraphicsPipeline(
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        num_native_indirect[stage] = static_cast<u32>(std::ranges::count_if(
+            stage_infos[stage].storage_buffers_descriptors,
+            [](const auto& desc) { return desc.native_indirect; }));
+        uses_native_indirect |= num_native_indirect[stage] != 0;
+    }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
@@ -426,10 +432,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             size_t ssbo_index{};
             for (const auto& desc : info.storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
+                if (desc.native_indirect) {
+                    // Last (GlobalMemoryToStorageBufferPass), bound below
+                    break;
+                }
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
                                                        desc.indirect_offset);
                 ++ssbo_index;
+            }
+            if (num_native_indirect[stage] != 0) [[unlikely]] {
+                BindNativeIndirect(stage, ssbo_index);
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
@@ -705,6 +718,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area);
 }
 
+void GraphicsPipeline::BindNativeIndirect(size_t stage, size_t first_index) {
+    // Can wait for the GPU (a host read back of GPU-written records), so before the descriptor
+    // queue is acquired, as for compute.
+    const Shader::Info& info{stage_infos[stage]};
+    const u32 first{Shader::Backend::SPIRV::NativeIndirectBasesFirst(
+        info.is_mesh ? Shader::Stage::Mesh : Shader::Stage::Task)};
+    buffer_cache.BindGraphicsIndirectStorageBuffers(
+        stage, first_index, info.native_indirect_slots,
+        std::span{native_indirect_bases}.subspan(first, num_native_indirect[stage]));
+}
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
@@ -836,6 +859,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    if (uses_native_indirect) [[unlikely]] {
+        // Only pipelines with task or mesh indirect bindings: the bases bound for this draw.
+        scheduler.Record([this, bases = native_indirect_bases](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PushConstants(*pipeline_layout,
+                                 VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                     VK_SHADER_STAGE_MESH_BIT_EXT,
+                                 Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET,
+                                 static_cast<u32>(sizeof(bases)), bases.data());
+        });
+    }
     return true;
 }
 

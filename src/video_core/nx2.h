@@ -26,10 +26,12 @@ inline std::atomic<bool> g_nx2_ampere{false};
 
 // EDEN_NX2_INDIRECT_POINTERS=guest (experiment): read native programs' pointer records from
 // guest memory only, even where the GPU wrote them (no host read back, no wait). Default: from
-// the buffer's host copy when the record's bytes are marked GPU-written.
+// the buffer's host copy when the record's bytes are marked GPU-written. =compute keeps the
+// bindings to compute programs (Shader::Optimization::NativeIndirectGraphicsPointers); the words
+// combine (compute,guest).
 inline const bool g_nx2_indirect_guest_reads = [] {
     const char* value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
-    return value != nullptr && std::string_view{value} == "guest";
+    return value != nullptr && std::string_view{value}.find("guest") != std::string_view::npos;
 }();
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read

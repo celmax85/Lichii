@@ -405,7 +405,17 @@ size_t GetTotalPipelineWorkers() {
 // with global accesses no storage buffer covers, or covered only by binding a dynamically indexed
 // constant buffer's pointers or the targets of pointers loaded from records
 // (GlobalMemoryToStorageBufferPass). Loads through a loaded pointer that stay unbound are
-// loaded-ptr:l; indirect-bound:l are the ones bound per dispatch.
+// loaded-ptr:l; indirect-bound:l are the ones bound per dispatch (compute) or draw (task, mesh).
+// indirect_pointers: 0 off, 1 compute only (EDEN_NX2_INDIRECT_POINTERS=compute), 2 compute, task
+// and mesh.
+/// EDEN_NX2_INDIRECT_POINTERS as the logs and the translation cache id show it: 0 off, 1 compute
+/// programs only, 2 compute, task and mesh programs
+u32 IndirectPointersMode() {
+    return Shader::Optimization::NativeIndirectGraphicsPointers() ? 2U
+           : Shader::Optimization::NativeIndirectPointers()       ? 1U
+                                                                  : 0U;
+}
+
 void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info) {
     static const bool enabled = [] {
         const auto set = [](const char* name) {
@@ -451,7 +461,7 @@ void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info)
              stats.indirect_slots_dropped, stats.indirect_bindings,
              info.storage_buffers_descriptors.size(),
              Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0,
-             Shader::Optimization::NativeIndirectPointers() ? 1 : 0);
+             IndirectPointersMode());
 }
 
 } // Anonymous namespace
