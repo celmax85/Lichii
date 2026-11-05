@@ -32,6 +32,34 @@ namespace Tegra {
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
+namespace {
+// Host methods that can write guest memory: semaphore releases, and anything unrecognised.
+bool PullerMethodWritesMemory(u32 method) {
+    switch (static_cast<BufferMethods>(method)) {
+    case BufferMethods::BindObject:
+    case BufferMethods::Nop:
+    case BufferMethods::SemaphoreAddressHigh:
+    case BufferMethods::SemaphoreAddressLow:
+    case BufferMethods::SemaphoreSequencePayload:
+    case BufferMethods::NonStallInterrupt:
+    case BufferMethods::WrcacheFlush:
+    case BufferMethods::MemOpA:
+    case BufferMethods::MemOpB:
+    case BufferMethods::MemOpC:
+    case BufferMethods::MemOpD:
+    case BufferMethods::RefCnt:
+    case BufferMethods::SemaphoreAcquire: // Ampere: SEM_PAYLOAD_HI, like 0x17..0x19
+    case BufferMethods::SyncpointPayload:
+    case BufferMethods::SyncpointOperation:
+    case BufferMethods::WaitForIdle:
+    case BufferMethods::Yield:
+        return false;
+    default:
+        return !(method >= 0x17 && method <= 0x19);
+    }
+}
+} // namespace
+
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
     , memory_manager{memory_manager_}
@@ -451,7 +479,9 @@ void DmaPusher::CallMethod(u32 argument) {
             dma_state.subchannel,
             dma_state.method_count,
         });
-        split.NoteMemoryBarrier();
+        if (PullerMethodWritesMemory(dma_state.method)) {
+            split.NoteMemoryBarrier();
+        }
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
@@ -515,7 +545,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (dma_state.method < non_puller_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
-        split.NoteMemoryBarrier();
+        for (u32 i = 0; i < num_methods; ++i) {
+            if (PullerMethodWritesMemory(dma_state.method + (dma_state.non_incrementing ? 0 : i))) {
+                split.NoteMemoryBarrier();
+                break;
+            }
+        }
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
