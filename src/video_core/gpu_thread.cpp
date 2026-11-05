@@ -18,6 +18,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -66,6 +67,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                const u64 seen_latch = Tegra::Nx2SemaphoreWaiters::Get().LatchEpoch();
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
@@ -79,7 +81,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        // A GPU release that meets a suspended acquire wakes this at once;
+                        // CPU releases are still found by polling.
+                        Tegra::Nx2SemaphoreWaiters::Get().WaitForLatch(
+                            seen_latch, std::chrono::milliseconds{1});
                     }
                     continue;
                 }

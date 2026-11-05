@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -385,12 +387,33 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    latched = true;
+                }
+            }
+            if (latched) {
+                ++latch_epoch;
             }
         }
+        if (latched) {
+            latch_cv.notify_all();
+        }
+    }
+
+    [[nodiscard]] u64 LatchEpoch() {
+        std::scoped_lock lk{mutex};
+        return latch_epoch;
+    }
+
+    /// Sleeps until a waiter latches after `seen` (LatchEpoch) or `timeout` passes.
+    void WaitForLatch(u64 seen, std::chrono::microseconds timeout) {
+        std::unique_lock lk{mutex};
+        latch_cv.wait_for(lk, timeout, [&] { return latch_epoch != seen; });
     }
 
 private:
@@ -416,6 +439,8 @@ private:
     }
 
     std::mutex mutex;
+    std::condition_variable latch_cv;
+    u64 latch_epoch{};
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
 };
