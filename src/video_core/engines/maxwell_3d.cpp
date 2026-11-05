@@ -874,8 +874,6 @@ struct Maxwell3D::FrontState {
         u64 position;
     };
     std::unordered_map<GPUVAddr, ShadowWord> cb_shadow;
-    /// Ring position when cb_shadow was last cleared with words still queued.
-    u64 cb_shadow_lost{};
     /// The inline-to-memory upload being sent writes [upload_begin, upload_end).
     bool upload_tracked{};
     GPUVAddr upload_begin{};
@@ -1063,7 +1061,6 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             std::erase_if(fs.cb_shadow, [done](const auto& entry) { return entry.second.position <= done; });
             if (fs.cb_shadow.size() >= 16384) {
                 fs.cb_shadow.clear();
-                fs.cb_shadow_lost = split.Position();
             }
         }
         const u64 position = split.Position();
@@ -1305,23 +1302,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (target > consumed && shadow_enabled) {
             const u64 opaque =
                 split.OpaqueReadyPosition(&memory_manager, source, source + read_bytes);
-            // Write tracking is per 64-byte block: words next to queued ones may not be written
-            // by queued work at all. Such a word is in memory once no opaque write is queued and
-            // the shadow lost no queued word.
-            const bool memory_ready = opaque <= consumed && fs.cb_shadow_lost <= consumed;
             shadow_words.clear();
             for (u32 i = 0; i < words; ++i) {
-                const GPUVAddr word_address = source + u64{i} * sizeof(u32);
-                const auto it = fs.cb_shadow.find(word_address);
-                if (it != fs.cb_shadow.end() && it->second.position > consumed &&
-                    it->second.position >= opaque) {
-                    shadow_words.push_back(it->second.value);
-                } else if (memory_ready) {
-                    shadow_words.push_back(memory_manager.Read<u32>(word_address));
-                } else {
+                const auto it = fs.cb_shadow.find(source + u64{i} * sizeof(u32));
+                // Only words still queued: memory has the others, maybe rewritten by the CPU.
+                if (it == fs.cb_shadow.end() || it->second.position < opaque ||
+                    it->second.position <= consumed) {
                     shadow_words.clear();
                     break;
                 }
+                shadow_words.push_back(it->second.value);
             }
         }
         const bool from_shadow = !shadow_words.empty();

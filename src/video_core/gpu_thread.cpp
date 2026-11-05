@@ -121,11 +121,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     const ThreadStats::Timer timer{thread_stats, ThreadStats::PendingEmpty};
-                    // Deferred acquires resume once the back reaches their check: keep
-                    // polling while it has work queued.
                     if (std::chrono::steady_clock::now() - last_progress <
-                            std::chrono::microseconds{500} ||
-                        (split.Active() && split.Consumed() < split.Position())) {
+                        std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
                         // A GPU release that meets a suspended acquire wakes this at once;
