@@ -211,6 +211,21 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     }
 }
 
+void Puller::NoteRelease(GPUVAddr address, u32 payload) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        return;
+    }
+    if (queued_releases.size() >= 1024) {
+        const u64 done = split.Consumed();
+        std::erase_if(queued_releases, [done](const auto& entry) { return entry.second.position <= done; });
+        if (queued_releases.size() >= 1024) {
+            queued_releases.clear();
+        }
+    }
+    queued_releases[address] = {payload, split.Position()};
+}
+
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
@@ -241,6 +256,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const u64 size = properties == VideoCommon::QueryPropertiesFlags::IsAFence ? 4 : 16;
         VideoCommon::GpuSplit::Get().NoteMemoryWrite(&dma_pusher.memory_manager, sequence_address,
                                                      sequence_address + size);
+        NoteRelease(sequence_address, payload);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -271,6 +287,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
             split.NoteSync();
             return;
+        }
+        if (fast_acquire && split.Active()) {
+            // This channel's own release, still queued, meets it once the back runs it, which is
+            // before anything sent after the acquire.
+            if (const auto it = queued_releases.find(acquire.address);
+                it != queued_releases.end() && it->second.position > split.Consumed() &&
+                acquire.Matches(it->second.payload)) {
+                split.NoteSync();
+                return;
+            }
         }
         if (fast_acquire && split.Active()) {
             // Only queued work that writes the semaphore (or untracked writes) can change it.
@@ -372,6 +398,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         });
         VideoCommon::GpuSplit::Get().NoteMemoryWrite(&dma_pusher.memory_manager, address,
                                                      address + 4);
+        NoteRelease(address, payload);
         return;
     }
     static const bool fast_acquire = [] {
@@ -379,6 +406,19 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return value == nullptr || value[0] != '0';
     }();
     auto& split = VideoCommon::GpuSplit::Get();
+    if (fast_acquire && operation <= 3 && operation != 1 && split.Active()) {
+        // This channel's own queued release meets it before anything sent after the acquire.
+        if (const auto it = queued_releases.find(address);
+            it != queued_releases.end() && it->second.position > split.Consumed()) {
+            const u32 released = it->second.payload;
+            if (operation == 0 ? released == payload
+                : operation == 2 ? released >= payload
+                                 : static_cast<s32>(released - payload) >= 0) {
+                split.NoteSync();
+                return;
+            }
+        }
+    }
     if (fast_acquire && (operation == 2 || operation == 3) && split.Active()) {
         // A greater-or-equal value already in memory stays met: skip the back drain.
         const u32 current = dma_pusher.memory_manager.Read<u32>(address);
