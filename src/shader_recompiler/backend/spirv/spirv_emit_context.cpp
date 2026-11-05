@@ -19,6 +19,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/ir_opt/passes.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -504,8 +505,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
-    DefineGlobalMemoryFunctions(program);
+    // The global memory functions read the indirect bases from the push constant block the
+    // rescaling input may define.
     DefineRescalingInput(program.info);
+    DefineNativeIndirectBases(program.info);
+    DefineGlobalMemoryFunctions(program);
     DefineRenderArea(program.info);
 }
 
@@ -969,7 +973,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
-                               auto&& callback) {
+                               bool writes, auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
@@ -983,7 +987,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             // The pointer is read through the buffer bound for the constant buffer pointer.
             const auto holder{std::ranges::find_if(
                 info.storage_buffers_descriptors, [&ssbo](const auto& desc) {
-                    return desc.cbuf_index == ssbo.cbuf_index &&
+                    return !desc.native_indirect && desc.cbuf_index == ssbo.cbuf_index &&
                            desc.cbuf_offset == ssbo.cbuf_offset && desc.indirect_offset == ~0U;
                 })};
             if (holder == info.storage_buffers_descriptors.end()) {
@@ -1020,19 +1024,39 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }};
         if (info.native_global_bounds) {
             // Native pointers carry no NVN size word. The address belongs to the candidate buffer
-            // whose base is the closest one at or below it (bounds come from the binding).
+            // whose base is the closest one at or below it (upstream #150). With
+            // EDEN_NX2_INDIRECT_POINTERS (14b9ce0dab), only among those whose bound length reaches
+            // it: a miss loads zero and stores nothing instead of landing out of range in the
+            // closest buffer. Buffers bound to pointers loaded from records (native_indirect) take
+            // their base from the push constants and are read only.
             std::vector<Id> bases(num_buffers);
             Id best_index{Const(~0U)};
             Id best_distance{Constant(U64, ~u64{0})};
+            const bool bounded_pick{Optimization::NativeIndirectPointers()};
+            u32 indirect_index{};
             for (size_t index = 0; index < num_buffers; ++index) {
-                bases[index] = base_address(index);
+                const bool indirect{info.storage_buffers_descriptors[index].native_indirect};
+                const u32 indirect_slot{indirect ? indirect_index++ : 0U};
+                if (indirect && (writes || !Sirit::ValidId(native_indirect_bases_push_constant))) {
+                    continue;
+                }
+                bases[index] = indirect ? NativeIndirectBase(indirect_slot) : base_address(index);
                 const Id distance{OpISub(U64, addr, bases[index])};
-                const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
-                                             OpULessThan(U1, distance, best_distance))};
+                Id inside{OpUGreaterThanEqual(U1, addr, bases[index])};
+                if (bounded_pick) {
+                    const Id element{OpShiftRightLogical(U64, distance, Const(shift))};
+                    const Id length{OpUConvert(U64, ArrayLength(ssbos[index].*ssbo_member))};
+                    inside = OpLogicalAnd(U1, inside, OpULessThan(U1, element, length));
+                }
+                const Id better{
+                    OpLogicalAnd(U1, inside, OpULessThan(U1, distance, best_distance))};
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
             for (size_t index = 0; index < num_buffers; ++index) {
+                if (!Sirit::ValidId(bases[index])) {
+                    continue;
+                }
                 access(index, bases[index],
                        OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
             }
@@ -1069,7 +1093,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift,
+        define_body(ssbo_member, addr, element_pointer, shift, false,
                     [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
@@ -1092,7 +1116,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+        define_body(ssbo_member, addr, element_pointer, shift, true, [&](Id ssbo_pointer) {
             OpStore(ssbo_pointer, data);
             OpReturn();
         });
@@ -1138,7 +1162,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id address{OpFunctionParameter(U64)};
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2, true,
                     [&](Id pointer) {
                         OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
                                           ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
@@ -1159,7 +1183,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2, true,
                     [&](Id pointer) {
                         OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
                                                               u32_zero_value, u32_zero_value,
@@ -1176,14 +1200,14 @@ void EmitContext::DefineRescalingInput(const Info& info) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
+        DefineRescalingInputPushConstant(info);
     } else {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1200,9 +1224,20 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    const bool indirect_bases{UsesNativeIndirectBases(info)};
+    if (indirect_bases) {
+        members.push_back(NativeIndirectBasesType());
+        native_indirect_bases_member_index = member_index++;
+    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
+    if (indirect_bases) {
+        MemberDecorate(push_constant_struct, native_indirect_bases_member_index,
+                       spv::Decoration::Offset, NATIVE_INDIRECT_BASES_OFFSET);
+        MemberName(push_constant_struct, native_indirect_bases_member_index,
+                   "native_indirect_bases");
+    }
 
     MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
@@ -1221,6 +1256,9 @@ void EmitContext::DefineRescalingInputPushConstant() {
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    if (indirect_bases) {
+        native_indirect_bases_push_constant = rescaling_push_constants;
+    }
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1238,6 +1276,58 @@ void EmitContext::DefineRescalingInputUniformConstant() {
     }
 }
 
+bool EmitContext::UsesNativeIndirectBases(const Info& info) const {
+    // The render area block is a push constant block of its own (one per entry point allowed);
+    // without the bases the indirect bindings are left out of the selection.
+    return stage == Stage::Compute && profile.unified_descriptor_binding &&
+           !info.uses_render_area &&
+           std::ranges::any_of(info.storage_buffers_descriptors,
+                               [](const auto& desc) { return desc.native_indirect; });
+}
+
+Id EmitContext::NativeIndirectBasesType() {
+    const Id type{TypeArray(U32[2], Const(static_cast<u32>(Info::MAX_NATIVE_INDIRECT_BINDINGS)))};
+    Decorate(type, spv::Decoration::ArrayStride, static_cast<u32>(sizeof(u64)));
+    return type;
+}
+
+void EmitContext::DefineNativeIndirectBases(const Info& info) {
+    // One push constant block per entry point: the rescaling block already holds them if defined.
+    if (!UsesNativeIndirectBases(info) || Sirit::ValidId(native_indirect_bases_push_constant)) {
+        return;
+    }
+    const Id push_constant_struct{TypeStruct(NativeIndirectBasesType())};
+    Decorate(push_constant_struct, spv::Decoration::Block);
+    Name(push_constant_struct, "NativeIndirectBases");
+    MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, NATIVE_INDIRECT_BASES_OFFSET);
+    MemberName(push_constant_struct, 0, "native_indirect_bases");
+    native_indirect_bases_member_index = 0;
+    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+    native_indirect_bases_push_constant =
+        AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+    Name(native_indirect_bases_push_constant, "native_indirect_bases_push_constants");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(native_indirect_bases_push_constant);
+    }
+}
+
+Id EmitContext::NativeIndirectBase(u32 index) {
+    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, U32[2])};
+    const Id pointer{OpAccessChain(pointer_type, native_indirect_bases_push_constant,
+                                   Const(native_indirect_bases_member_index), Const(index))};
+    return OpBitcast(U64, OpLoad(U32[2], pointer));
+}
+
+Id EmitContext::ArrayLength(Id ssbo) {
+    // Sirit has no OpArrayLength: emit an OpAccessChain of the same shape and rewrite it after
+    // assembly (PatchArrayLengths).
+    if (!Sirit::ValidId(array_length_marker)) {
+        array_length_marker = Constant(U32[1], 0x4c454e47U);
+    }
+    const Id result{OpAccessChain(U32[1], ssbo, array_length_marker)};
+    array_length_results.push_back(result.value);
+    return result;
+}
 void EmitContext::DefineRenderArea(const Info& info) {
     if (!info.uses_render_area) {
         return;

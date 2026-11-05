@@ -33,6 +33,13 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
+// Base addresses (u64) of a native compute program's native_indirect storage buffers, after the
+// rescaling and render area words.
+constexpr u32 NATIVE_INDIRECT_BASES_OFFSET = 64;
+constexpr u32 NATIVE_INDIRECT_BASES_SIZE = 8 * sizeof(u64);
+static_assert(NATIVE_INDIRECT_BASES_OFFSET >= sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+// Within the 128 bytes of push constants every Vulkan device supports
+static_assert(NATIVE_INDIRECT_BASES_OFFSET + NATIVE_INDIRECT_BASES_SIZE <= 128);
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;

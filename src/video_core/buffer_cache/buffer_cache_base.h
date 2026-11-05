@@ -314,6 +314,13 @@ public:
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U);
 
+    /// Binds a native program's read-only storage buffers for pointers loaded from records
+    /// (Shader::Info::native_indirect_slots) at first_index on, one per element of `bases`, and
+    /// writes the base address the shader sees for each (0 when unused).
+    void BindComputeIndirectStorageBuffers(size_t first_index,
+                                           std::span<const Shader::NativeIndirectSlot> slots,
+                                           std::span<u64> bases);
+
     void UnbindComputeTextureBuffers();
 
     void BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size, PixelFormat format,
@@ -599,6 +606,16 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
                                                bool table_pointer = false) const;
+
+    /// StorageBufferBinding for the pointer gpu_addr read from ssbo_addr
+    [[nodiscard]] Binding StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
+                                                 u32 cbuf_index, bool is_written,
+                                                 bool native_pointer,
+                                                 bool table_pointer = false) const;
+
+    /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
+    /// copies where GPU work wrote them
+    void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out);
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,

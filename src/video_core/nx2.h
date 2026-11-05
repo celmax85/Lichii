@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <string_view>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -22,6 +24,13 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// EDEN_NX2_INDIRECT_POINTERS=guest (experiment): read native programs' pointer records from
+// guest memory only, even where the GPU wrote them (no host read back, no wait). Default: from
+// the buffer's host copy when the record's bytes are marked GPU-written.
+inline const bool g_nx2_indirect_guest_reads = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
+    return value != nullptr && std::string_view{value} == "guest";
+}();
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
 // without a flush they are stale and the draws behind them (trees) go missing. The bits never
