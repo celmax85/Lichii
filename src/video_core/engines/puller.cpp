@@ -238,6 +238,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        VideoCommon::GpuSplit::Get().NoteMemoryBarrier();
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -255,6 +256,20 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // A greater-or-equal acquire whose value is already in guest memory is met: releases only
+        // raise the value, and one still queued for the back (or held in its caches) is newer.
+        // Skip draining the back for it (~8% of the front in Ocarina of Time); later command
+        // fetches still wait for the work before it (NoteSync). EDEN_NX2_ACQUIRE_FAST=0: drain.
+        static const bool fast_acquire = [] {
+            const char* value = std::getenv("EDEN_NX2_ACQUIRE_FAST");
+            return value == nullptr || value[0] != '0';
+        }();
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (fast_acquire && op == GpuSemaphoreOperation::AcquireGequal && split.Active() &&
+            acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            split.NoteSync();
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
