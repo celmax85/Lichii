@@ -184,6 +184,9 @@ public:
     [[nodiscard]] u64 MemoryBarrierPosition() const {
         return std::max(last_barrier_position, last_writer_position);
     }
+    [[nodiscard]] u64 WriterPosition() const {
+        return last_writer_position;
+    }
     [[nodiscard]] u64 Position() const {
         return write_position;
     }

@@ -875,6 +875,10 @@ struct Maxwell3D::FrontState {
     };
     std::vector<PendingWrite> pending_writes;
     u32 dma_reads{};
+    /// The inline-to-memory upload being sent writes [upload_begin, upload_end).
+    bool upload_tracked{};
+    GPUVAddr upload_begin{};
+    GPUVAddr upload_end{};
 };
 
 namespace {
@@ -1035,21 +1039,14 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
     const auto covers = [method, amount](u32 index) {
         return method <= index && index < method + amount;
     };
-    if (method >= cb_data && method < cb_data + 16) {
-        const GPUVAddr address =
-            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
-            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
-        const u64 offset_end = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
-        const u64 bytes = u64{amount} * sizeof(u32);
-        if (offset_end < bytes) {
-            split.NoteMemoryBarrier();
-            return;
-        }
-        const GPUVAddr begin = address + offset_end - bytes;
-        const GPUVAddr end = address + offset_end;
+    const auto address = [&fs](u32 high, u32 low) {
+        return (GPUVAddr{fs.regs[high]} << 32) | fs.regs[low];
+    };
+    const auto note = [&split, &fs](GPUVAddr begin, GPUVAddr end) {
         const u64 position = split.Position();
         auto& writes = fs.pending_writes;
-        if (!writes.empty() && writes.back().end == begin) {
+        if (!writes.empty() && (writes.back().end == begin ||
+                                (writes.back().begin == begin && writes.back().end == end))) {
             writes.back().end = end;
             writes.back().position = position;
             return;
@@ -1063,13 +1060,49 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             }
         }
         writes.push_back({begin, end, position});
+    };
+    if (method >= cb_data && method < cb_data + 16) {
+        const GPUVAddr base = address(MAXWELL3D_REG_INDEX(const_buffer.address_high),
+                                      MAXWELL3D_REG_INDEX(const_buffer.address_low));
+        const u64 offset_end = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+        const u64 bytes = u64{amount} * sizeof(u32);
+        if (offset_end < bytes) {
+            split.NoteMemoryBarrier();
+            return;
+        }
+        note(base + offset_end - bytes, base + offset_end);
         return;
     }
-    // Inline-to-memory uploads, report and semaphore releases, and root table loads write memory
-    // at addresses not tracked here.
-    if (covers(MAXWELL3D_REG_INDEX(launch_dma)) || covers(MAXWELL3D_REG_INDEX(inline_data)) ||
-        covers(MAXWELL3D_REG_INDEX(report_semaphore.query)) || covers(RootTables::LoadMethod)) {
-        split.NoteMemoryBarrier();
+    if (covers(MAXWELL3D_REG_INDEX(launch_dma))) {
+        // Inline-to-memory: a pitch-linear upload writes its lines from the destination address;
+        // a block-linear one or a release on completion is not tracked.
+        const u32 launch = fs.regs[MAXWELL3D_REG_INDEX(launch_dma)];
+        const bool pitch_layout = (launch & 1) != 0;   // memory_layout: Pitch
+        const bool release = ((launch >> 4) & 3) == 2; // completion_type: Release
+        const u64 line_length = fs.regs[MAXWELL3D_REG_INDEX(upload.line_length_in)];
+        const u64 lines = fs.regs[MAXWELL3D_REG_INDEX(upload.line_count)];
+        const u64 pitch = fs.regs[MAXWELL3D_REG_INDEX(upload.dest.pitch)];
+        fs.upload_tracked = pitch_layout && !release && lines != 0;
+        if (fs.upload_tracked) {
+            fs.upload_begin = address(MAXWELL3D_REG_INDEX(upload.dest.address_high),
+                                      MAXWELL3D_REG_INDEX(upload.dest.address_low));
+            fs.upload_end = fs.upload_begin + (std::max)(pitch, line_length) * (lines - 1) + line_length;
+        } else {
+            split.NoteMemoryBarrier();
+        }
+    }
+    if (covers(MAXWELL3D_REG_INDEX(inline_data))) {
+        if (fs.upload_tracked) {
+            note(fs.upload_begin, fs.upload_end);
+        } else {
+            split.NoteMemoryBarrier();
+        }
+    }
+    if (covers(MAXWELL3D_REG_INDEX(report_semaphore.query))) {
+        // A release writes its payload, or a 16-byte report, at the semaphore address.
+        const GPUVAddr begin = address(MAXWELL3D_REG_INDEX(report_semaphore.address_high),
+                                       MAXWELL3D_REG_INDEX(report_semaphore.address_low));
+        note(begin, begin + 16);
     }
 }
 
@@ -1268,6 +1301,21 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         for (const auto& write : fs.pending_writes) {
             if (write.begin < end && source < write.end) {
                 target = (std::max)(target, write.position);
+            }
+        }
+        // EDEN_NX2_MME_DMA_STATS: why precise reads wait (writer = compute or copy work).
+        if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr; stats) {
+            static std::array<u64, 4> causes{};
+            const u64 writer = split.WriterPosition();
+            const u64 barrier = split.MemoryBarrierPosition();
+            const size_t cause = target <= consumed ? 0
+                                 : target == writer ? 1
+                                 : target == barrier ? 2
+                                                     : 3;
+            ++causes[cause];
+            if (((causes[0] + causes[1] + causes[2] + causes[3]) & 0xffff) == 0) {
+                LOG_INFO(HW_GPU, "MME DMA reads: no wait {}, writer {}, barrier {}, constant buffer {}",
+                         causes[0], causes[1], causes[2], causes[3]);
             }
         }
         if (target > consumed) {
