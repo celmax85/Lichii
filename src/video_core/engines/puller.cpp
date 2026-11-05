@@ -238,7 +238,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
-        VideoCommon::GpuSplit::Get().NoteMemoryBarrier();
+        const u64 size = properties == VideoCommon::QueryPropertiesFlags::IsAFence ? 4 : 16;
+        VideoCommon::GpuSplit::Get().NoteMemoryWrite(&dma_pusher.memory_manager, sequence_address,
+                                                     sequence_address + size);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -269,6 +271,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
             split.NoteSync();
             return;
+        }
+        if (fast_acquire && split.Active()) {
+            // Only queued work that writes the semaphore (or untracked writes) can change it.
+            split.WaitForPosition(split.ReadReadyPosition(&dma_pusher.memory_manager,
+                                                          acquire.address, acquire.address + 4),
+                                  VideoCommon::DrainSite::Acquire);
+            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+                split.NoteSync();
+                return;
+            }
         }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
