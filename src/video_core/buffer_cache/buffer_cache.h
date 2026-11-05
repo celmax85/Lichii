@@ -1312,8 +1312,28 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
-        if (mapped_size != 0) {
-            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
+        const u64 check_size = (std::min<u64>)(mapped_size, size);
+        // EDEN_NX2_BANK_SNAPSHOT=0: mark the bank modified every frame.
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_BANK_SNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        bool changed = true;
+        if (snapshot && check_size != 0) {
+            if (native_indirect_uniform_snapshots.size() >= 1024) {
+                native_indirect_uniform_snapshots.clear();
+            }
+            tmp_buffer.resize_destructive(check_size);
+            device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), check_size);
+            auto& last = native_indirect_uniform_snapshots[device_addr];
+            changed = last.size() != check_size ||
+                      std::memcmp(last.data(), tmp_buffer.data(), check_size) != 0;
+            if (changed) {
+                last.assign(tmp_buffer.data(), tmp_buffer.data() + check_size);
+            }
+        }
+        if (check_size != 0 && changed) {
+            memory_tracker.MarkRegionAsCpuModified(device_addr, check_size);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
