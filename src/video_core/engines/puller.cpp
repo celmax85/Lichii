@@ -365,13 +365,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 }
             }
             // EDEN_NX2_ACQUIRE_LEARN=0: always wait. Otherwise an address queued GPU work met
-            // 8 times in a row (compute completion) is trusted to be met by the work before it;
+            // 8 times in a row (compute completion, releases) is trusted to be met by the work before it;
             // the back checks each skipped one and stops trusting the address if it was not.
             static const bool learn = [] {
                 const char* value = std::getenv("EDEN_NX2_ACQUIRE_LEARN");
                 return value == nullptr || value[0] != '0';
             }();
-            const bool queued_writer = target > split.Consumed() && target == split.WriterPosition();
+            // Any queued write the back makes before this point (compute, releases, reports).
+            const bool queued_writer = target > split.Consumed();
             if (learn && has_unmet_acquires.exchange(false, std::memory_order_acquire)) {
                 std::scoped_lock lock{unmet_mutex};
                 for (const GPUVAddr unmet : unmet_acquires) {
