@@ -2759,19 +2759,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
     } else {
-        // EDEN_NX2_CLEAR_TRACE=1: why a target created by a clear is still uploaded.
+        // EDEN_NX2_CLEAR_TRACE=1: images uploaded when created, with the clear state.
         static const bool clear_trace = std::getenv("EDEN_NX2_CLEAR_TRACE") != nullptr;
-        if (clear_trace && clearing_render_targets &&
-            True(new_image.flags & ImageFlagBits::CpuModified)) {
+        if (clear_trace && True(new_image.flags & ImageFlagBits::CpuModified)) {
             static u32 logged{};
-            if (logged < 64) {
+            if (logged < 200) {
                 ++logged;
                 const auto& regs = maxwell3d->regs;
                 LOG_INFO(HW_GPU,
-                         "Clear target upload {:#x}: format {} {}x{} type {} levels {} layers {} "
+                         "Clear target upload {:#x} (clearing {}): format {} {}x{} type {} levels {} layers {} "
                          "samples {} joins {} | clear RT {} RGBA {}{}{}{} Z {} S {} layer {} "
                          "scissor {} ({},{})-({},{}) rt0 {:#x} {}x{} count {} zeta {} {:#x} {}x{}",
-                         gpu_addr, static_cast<u32>(new_info.format), new_info.size.width,
+                         gpu_addr, clearing_render_targets, static_cast<u32>(new_info.format), new_info.size.width,
                          new_info.size.height, static_cast<u32>(new_info.type),
                          new_info.resources.levels, new_info.resources.layers,
                          new_info.num_samples, join_copies_to_do.size(),
