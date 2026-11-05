@@ -11,6 +11,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -200,6 +201,39 @@ public:
         WaitFor(std::min(target, write_position), site);
     }
 
+    /// Work just sent writes [begin, end) of the GPU address space `space` (a memory manager).
+    void NoteMemoryWrite(const void* space, u64 begin, u64 end) {
+        if (!pending_writes.empty()) {
+            PendingWrite& last = pending_writes.back();
+            if (last.space == space &&
+                (last.end == begin || (last.begin == begin && last.end == end))) {
+                last.end = end;
+                last.position = write_position;
+                return;
+            }
+        }
+        if (pending_writes.size() >= 256) {
+            PrunePendingWrites();
+            if (pending_writes.size() >= 256) {
+                pending_writes.clear();
+                NoteMemoryBarrier();
+            }
+        }
+        pending_writes.push_back({space, begin, end, write_position});
+    }
+    /// The position the back must reach before [begin, end) of `space` can be read: the last
+    /// untracked write, or the last queued write that overlaps it.
+    [[nodiscard]] u64 ReadReadyPosition(const void* space, u64 begin, u64 end) {
+        PrunePendingWrites();
+        u64 target = MemoryBarrierPosition();
+        for (const PendingWrite& write : pending_writes) {
+            if (write.space == space && write.begin < end && begin < write.end) {
+                target = std::max(target, write.position);
+            }
+        }
+        return target;
+    }
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -259,6 +293,17 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_barrier_position{};
+    struct PendingWrite {
+        const void* space;
+        u64 begin;
+        u64 end;
+        u64 position;
+    };
+    std::vector<PendingWrite> pending_writes;
+    void PrunePendingWrites() {
+        const u64 done = Consumed();
+        std::erase_if(pending_writes, [done](const PendingWrite& write) { return write.position <= done; });
+    }
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};

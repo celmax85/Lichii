@@ -327,6 +327,8 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    VideoCommon::GpuSplit::Get().NoteMemoryWrite(&dma_pusher.memory_manager, sequence_address,
+                                                 sequence_address + 4);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -356,7 +358,22 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        VideoCommon::GpuSplit::Get().NoteMemoryWrite(&dma_pusher.memory_manager, address,
+                                                     address + 4);
         return;
+    }
+    static const bool fast_acquire = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_FAST");
+        return value == nullptr || value[0] != '0';
+    }();
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (fast_acquire && (operation == 2 || operation == 3) && split.Active()) {
+        // A greater-or-equal value already in memory stays met: skip the back drain.
+        const u32 current = dma_pusher.memory_manager.Read<u32>(address);
+        if (operation == 2 ? current >= payload : static_cast<s32>(current - payload) >= 0) {
+            split.NoteSync();
+            return;
+        }
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
     DrainBack();

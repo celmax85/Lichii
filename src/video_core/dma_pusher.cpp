@@ -33,7 +33,7 @@ constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
 namespace {
-// Host methods that can write guest memory: Ampere semaphore execution and anything unrecognised.
+// Host methods that can write guest memory without noting it themselves.
 bool PullerMethodWritesMemory(u32 method) {
     switch (static_cast<BufferMethods>(method)) {
     case BufferMethods::BindObject:
@@ -41,7 +41,8 @@ bool PullerMethodWritesMemory(u32 method) {
     case BufferMethods::SemaphoreAddressHigh:
     case BufferMethods::SemaphoreAddressLow:
     case BufferMethods::SemaphoreSequencePayload:
-    case BufferMethods::SemaphoreOperation: // Releases note their own barrier (Puller)
+    case BufferMethods::SemaphoreOperation: // Releases note their own writes (Puller)
+    case BufferMethods::SemaphoreRelease:
     case BufferMethods::NonStallInterrupt:
     case BufferMethods::WrcacheFlush:
     case BufferMethods::MemOpA:

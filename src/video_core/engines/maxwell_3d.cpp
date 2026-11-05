@@ -866,14 +866,6 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
-    /// Guest memory the back may still write for methods already sent (inline constant buffer
-    /// data), with the ring position after the write.
-    struct PendingWrite {
-        GPUVAddr begin;
-        GPUVAddr end;
-        u64 position;
-    };
-    std::vector<PendingWrite> pending_writes;
     u32 dma_reads{};
     /// The inline-to-memory upload being sent writes [upload_begin, upload_end).
     bool upload_tracked{};
@@ -1042,24 +1034,8 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
     const auto address = [&fs](u32 high, u32 low) {
         return (GPUVAddr{fs.regs[high]} << 32) | fs.regs[low];
     };
-    const auto note = [&split, &fs](GPUVAddr begin, GPUVAddr end) {
-        const u64 position = split.Position();
-        auto& writes = fs.pending_writes;
-        if (!writes.empty() && (writes.back().end == begin ||
-                                (writes.back().begin == begin && writes.back().end == end))) {
-            writes.back().end = end;
-            writes.back().position = position;
-            return;
-        }
-        if (writes.size() >= 256) {
-            const u64 consumed = split.Consumed();
-            std::erase_if(writes, [consumed](const auto& write) { return write.position <= consumed; });
-            if (writes.size() >= 256) {
-                writes.clear();
-                split.NoteMemoryBarrier();
-            }
-        }
-        writes.push_back({begin, end, position});
+    const auto note = [&split, this](GPUVAddr begin, GPUVAddr end) {
+        split.NoteMemoryWrite(&memory_manager, begin, end);
     };
     if (method >= cb_data && method < cb_data + 16) {
         const GPUVAddr base = address(MAXWELL3D_REG_INDEX(const_buffer.address_high),
@@ -1293,16 +1269,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                          fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] == 0 &&
                          (++fs.dma_reads & 255) != 0;
     if (precise) {
+        const u64 target = split.ReadReadyPosition(&memory_manager, source, source + read_bytes);
         const u64 consumed = split.Consumed();
-        const GPUVAddr end = source + read_bytes;
-        u64 target = split.MemoryBarrierPosition();
-        std::erase_if(fs.pending_writes,
-                      [consumed](const auto& write) { return write.position <= consumed; });
-        for (const auto& write : fs.pending_writes) {
-            if (write.begin < end && source < write.end) {
-                target = (std::max)(target, write.position);
-            }
-        }
         // EDEN_NX2_MME_DMA_STATS: why precise reads wait (writer = compute or copy work).
         if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr; stats) {
             static std::array<u64, 4> causes{};
@@ -1323,7 +1291,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     } else {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-        fs.pending_writes.clear();
     }
     if (!precise && VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
