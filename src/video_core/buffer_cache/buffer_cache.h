@@ -1323,13 +1323,27 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (native_indirect_uniform_snapshots.size() >= 1024) {
                 native_indirect_uniform_snapshots.clear();
             }
-            tmp_buffer.resize_destructive(check_size);
-            device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), check_size);
             auto& last = native_indirect_uniform_snapshots[device_addr];
-            changed = last.size() != check_size ||
-                      std::memcmp(last.data(), tmp_buffer.data(), check_size) != 0;
+            if (last.size() != check_size) {
+                last.resize(check_size);
+            } else {
+                // Compare in place, page by page (the pages were found mapped above).
+                changed = false;
+                for (u64 offset = 0; offset < check_size;) {
+                    const DAddr page_addr = device_addr + offset;
+                    const u64 chunk = (std::min<u64>)(
+                        check_size - offset,
+                        Core::DEVICE_PAGESIZE - (page_addr & Core::DEVICE_PAGEMASK));
+                    const u8* const guest = device_memory.template GetPointer<u8>(page_addr);
+                    if (guest == nullptr || std::memcmp(last.data() + offset, guest, chunk) != 0) {
+                        changed = true;
+                        break;
+                    }
+                    offset += chunk;
+                }
+            }
             if (changed) {
-                last.assign(tmp_buffer.data(), tmp_buffer.data() + check_size);
+                device_memory.ReadBlockUnsafe(device_addr, last.data(), check_size);
             }
         }
         if (check_size != 0 && changed) {
