@@ -1346,7 +1346,19 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     continue;
                 }
                 auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-                if (!inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+                const bool same =
+                    !inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+                // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
+                if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+                    stats) {
+                    static std::array<u64, 3> counts{};
+                    ++counts[same ? 0 : (inserted ? 1 : 2)];
+                    if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
+                        LOG_INFO(HW_GPU, "Native bank pages checked: same {}, new {}, changed {}",
+                                 counts[0], counts[1], counts[2]);
+                    }
+                }
+                if (same) {
                     continue;
                 }
                 std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
