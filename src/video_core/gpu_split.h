@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -175,6 +176,27 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
+    /// Work that may write guest memory at addresses the front does not track was just sent.
+    void NoteMemoryBarrier() {
+        last_barrier_position = write_position;
+    }
+    /// Where the last untracked memory write (or compute and copy work) was sent.
+    [[nodiscard]] u64 MemoryBarrierPosition() const {
+        return std::max(last_barrier_position, last_writer_position);
+    }
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// How far the back has executed.
+    [[nodiscard]] u64 Consumed() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache;
+    }
+    /// Waits until the back executed everything sent before `target`.
+    void WaitForPosition(u64 target, DrainSite site) {
+        WaitFor(std::min(target, write_position), site);
+    }
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -233,6 +255,7 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_barrier_position{};
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};

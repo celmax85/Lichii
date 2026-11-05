@@ -451,6 +451,7 @@ void DmaPusher::CallMethod(u32 argument) {
             dma_state.subchannel,
             dma_state.method_count,
         });
+        split.NoteMemoryBarrier();
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
@@ -461,9 +462,13 @@ void DmaPusher::CallMethod(u32 argument) {
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
+        // Other engines' memory writes are not tracked by address (Maxwell3D::FrontDmaRead).
+        const bool untracked_writes = engine_type != Engines::EngineTypes::Maxwell3D;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (untracked_writes) {
+                split.NoteMemoryBarrier();
             }
         };
         if (split.Active()) {
@@ -510,6 +515,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (dma_state.method < non_puller_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
+        split.NoteMemoryBarrier();
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
         if (subchannel == nullptr) {
@@ -520,9 +526,13 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
+        // Other engines' memory writes are not tracked by address (Maxwell3D::FrontDmaRead).
+        const bool untracked_writes = engine_type != Engines::EngineTypes::Maxwell3D;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (untracked_writes) {
+                split.NoteMemoryBarrier();
             }
         };
         if (split.Active()) {

@@ -866,6 +866,15 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// Guest memory the back may still write for methods already sent (inline constant buffer
+    /// data), with the ring position after the write.
+    struct PendingWrite {
+        GPUVAddr begin;
+        GPUVAddr end;
+        u64 position;
+    };
+    std::vector<PendingWrite> pending_writes;
+    u32 dma_reads{};
 };
 
 namespace {
@@ -1015,6 +1024,53 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (execution_mask[method]) {
+        FrontNoteWrites(split, fs, method, 1);
+    }
+}
+
+void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                u32 amount) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    const auto covers = [method, amount](u32 index) {
+        return method <= index && index < method + amount;
+    };
+    if (method >= cb_data && method < cb_data + 16) {
+        const GPUVAddr address =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+        const u64 offset_end = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+        const u64 bytes = u64{amount} * sizeof(u32);
+        if (offset_end < bytes) {
+            split.NoteMemoryBarrier();
+            return;
+        }
+        const GPUVAddr begin = address + offset_end - bytes;
+        const GPUVAddr end = address + offset_end;
+        const u64 position = split.Position();
+        auto& writes = fs.pending_writes;
+        if (!writes.empty() && writes.back().end == begin) {
+            writes.back().end = end;
+            writes.back().position = position;
+            return;
+        }
+        if (writes.size() >= 256) {
+            const u64 consumed = split.Consumed();
+            std::erase_if(writes, [consumed](const auto& write) { return write.position <= consumed; });
+            if (writes.size() >= 256) {
+                writes.clear();
+                split.NoteMemoryBarrier();
+            }
+        }
+        writes.push_back({begin, end, position});
+        return;
+    }
+    // Inline-to-memory uploads, report and semaphore releases, and root table loads write memory
+    // at addresses not tracked here.
+    if (covers(MAXWELL3D_REG_INDEX(launch_dma)) || covers(MAXWELL3D_REG_INDEX(inline_data)) ||
+        covers(MAXWELL3D_REG_INDEX(report_semaphore.query)) || covers(RootTables::LoadMethod)) {
+        split.NoteMemoryBarrier();
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1120,6 +1176,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    FrontNoteWrites(split, fs, method, amount);
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1187,8 +1244,40 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         diag_before.resize(words);
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-    if (VideoCommon::QueryDma::TraceEnabled()) {
+    // EDEN_NX2_MME_DMA_PRECISE=0: wait for everything queued before each read (the old way).
+    // Otherwise wait only for queued work that may write the words: compute, copies, untracked
+    // writes and overlapping inline constant buffer data. Ocarina of Time reads ~20,000 times a
+    // second; a full drain each time kept the two GPU threads waiting on each other. Every 256th
+    // read still drains and checks for GPU-written data, which turns the precise reads off.
+    static const bool precise_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MME_DMA_PRECISE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static bool precise_disabled{};
+    const bool precise = precise_enabled && !precise_disabled &&
+                         !VideoCommon::QueryDma::TraceEnabled() &&
+                         !Tegra::Nx2CmdPageDiag::g_enabled &&
+                         fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] == 0 &&
+                         (++fs.dma_reads & 255) != 0;
+    if (precise) {
+        const u64 consumed = split.Consumed();
+        const GPUVAddr end = source + read_bytes;
+        u64 target = split.MemoryBarrierPosition();
+        std::erase_if(fs.pending_writes,
+                      [consumed](const auto& write) { return write.position <= consumed; });
+        for (const auto& write : fs.pending_writes) {
+            if (write.begin < end && source < write.end) {
+                target = (std::max)(target, write.position);
+            }
+        }
+        if (target > consumed) {
+            split.WaitForPosition(target, VideoCommon::DrainSite::MacroDmaRead);
+        }
+    } else {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        fs.pending_writes.clear();
+    }
+    if (!precise && VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
                 if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
@@ -1202,7 +1291,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+    // The caches belong to the back, which may still be running after a precise wait.
+    if (!precise &&
+        memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+        if (precise_enabled && !precise_disabled) {
+            precise_disabled = true;
+            LOG_WARNING(HW_GPU, "Native MME DMA read of GPU-written memory at {:#x}: precise reads off",
+                        source);
+        }
         split.Run(
             [memory = &memory_manager, source, read_bytes] {
                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
