@@ -442,9 +442,11 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
-    /// The guest words each such bank had when last checked: unchanged banks keep their pages
-    /// tracked (marking them CPU-modified costs two mprotect calls per page and frame).
-    std::unordered_map<DAddr, std::vector<u8>> native_indirect_uniform_snapshots;
+    /// The guest words of each page of such banks when last checked, and the pages checked this
+    /// frame: unchanged pages keep their tracking (marking them CPU-modified costs two mprotect
+    /// calls per page and frame).
+    std::unordered_map<DAddr, std::array<u8, Core::DEVICE_PAGESIZE>> native_indirect_page_snapshots;
+    std::unordered_set<DAddr> native_indirect_pages_this_frame;
 
 private:
     template <typename Func>

@@ -112,6 +112,7 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
+    native_indirect_pages_this_frame.clear();
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -1324,36 +1325,33 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             const char* value = std::getenv("EDEN_NX2_BANK_SNAPSHOT");
             return value == nullptr || value[0] != '0';
         }();
-        bool changed = true;
-        if (snapshot && check_size != 0) {
-            if (native_indirect_uniform_snapshots.size() >= 1024) {
-                native_indirect_uniform_snapshots.clear();
+        if (!snapshot) {
+            if (check_size != 0) {
+                memory_tracker.MarkRegionAsCpuModified(device_addr, check_size);
             }
-            auto& last = native_indirect_uniform_snapshots[device_addr];
-            if (last.size() != check_size) {
-                last.resize(check_size);
-            } else {
-                // Compare in place, page by page (the pages were found mapped above).
-                changed = false;
-                for (u64 offset = 0; offset < check_size;) {
-                    const DAddr page_addr = device_addr + offset;
-                    const u64 chunk = (std::min<u64>)(
-                        check_size - offset,
-                        Core::DEVICE_PAGESIZE - (page_addr & Core::DEVICE_PAGEMASK));
-                    const u8* const guest = device_memory.template GetPointer<u8>(page_addr);
-                    if (guest == nullptr || std::memcmp(last.data() + offset, guest, chunk) != 0) {
-                        changed = true;
-                        break;
-                    }
-                    offset += chunk;
+        } else {
+            // Banks slide through larger buffers, a new address per draw: check each page once a
+            // frame against its last contents and mark only the pages that changed.
+            if (native_indirect_page_snapshots.size() >= 16384) {
+                native_indirect_page_snapshots.clear();
+            }
+            const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+            const DAddr end = device_addr + check_size;
+            for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+                if (!native_indirect_pages_this_frame.insert(page).second) {
+                    continue;
                 }
+                const u8* const guest = device_memory.template GetPointer<u8>(page);
+                if (guest == nullptr) {
+                    continue;
+                }
+                auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+                if (!inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+                    continue;
+                }
+                std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
+                memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
             }
-            if (changed) {
-                device_memory.ReadBlockUnsafe(device_addr, last.data(), check_size);
-            }
-        }
-        if (check_size != 0 && changed) {
-            memory_tracker.MarkRegionAsCpuModified(device_addr, check_size);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
