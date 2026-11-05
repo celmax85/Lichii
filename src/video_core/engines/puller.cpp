@@ -58,6 +58,43 @@ void OnBack(const Func& func) {
     }
 }
 
+// EDEN_NX2_MME_DMA_STATS: how semaphore acquires end and how long they hold the front.
+struct AcquireStats {
+    enum Kind : size_t { Fast, Own, Learned, AfterWait, AfterDrain, Suspended, Count };
+    std::array<u64, Count> counts{};
+    u64 wait_ns{};
+    u64 drain_ns{};
+    u64 suspended_ns{};
+    std::chrono::steady_clock::time_point last_log{std::chrono::steady_clock::now()};
+
+    static AcquireStats* Get() {
+        static const bool enabled = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+        static AcquireStats stats;
+        return enabled ? &stats : nullptr;
+    }
+    void Note(Kind kind) {
+        ++counts[kind];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log < std::chrono::seconds{5}) {
+            return;
+        }
+        last_log = now;
+        LOG_INFO(HW_GPU,
+                 "Acquires (5 s): fast {}, own release {}, learned {}, met after wait {} ({} ms), "
+                 "met after drain {} ({} ms), suspended {} ({} ms)",
+                 counts[Fast], counts[Own], counts[Learned], counts[AfterWait], wait_ns / 1000000,
+                 counts[AfterDrain], drain_ns / 1000000, counts[Suspended], suspended_ns / 1000000);
+        counts = {};
+        wait_ns = drain_ns = suspended_ns = 0;
+    }
+};
+
+u64 NsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
@@ -130,6 +167,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (auto* stats = AcquireStats::Get()) stats->suspended_ns += NsSince(pending_acquire->since);
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -285,6 +323,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         auto& split = VideoCommon::GpuSplit::Get();
         if (fast_acquire && op == GpuSemaphoreOperation::AcquireGequal && split.Active() &&
             acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Fast);
             split.NoteSync();
             return;
         }
@@ -294,6 +333,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (const auto it = queued_releases.find(acquire.address);
                 it != queued_releases.end() && it->second.position > split.Consumed() &&
                 acquire.Matches(it->second.payload)) {
+                if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Own);
                 split.NoteSync();
                 return;
             }
@@ -351,11 +391,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                             has_unmet_acquires.store(true, std::memory_order_release);
                         }
                     });
+                    if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Learned);
                     split.NoteSync();
                     return;
                 }
             }
+            const auto wait_start = std::chrono::steady_clock::now();
             split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
+            if (auto* stats = AcquireStats::Get()) stats->wait_ns += NsSince(wait_start);
             const bool met = acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
             if (learn && queued_writer) {
                 u32& count = gpu_met_acquires[acquire.address];
@@ -364,12 +407,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 }
             }
             if (met) {
+                if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterWait);
                 split.NoteSync();
                 return;
             }
         }
+        const auto drain_start = std::chrono::steady_clock::now();
         DrainBack();
+        if (auto* stats = AcquireStats::Get()) stats->drain_ns += NsSince(drain_start);
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterDrain);
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -381,10 +428,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         ReleaseFences(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
+            pending_acquire->since = std::chrono::steady_clock::now();
+            if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Suspended);
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
         } else {
             waiters.Remove(this);
+            if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterDrain);
         }
     } else {
         DrainBack();
