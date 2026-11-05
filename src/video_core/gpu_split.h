@@ -208,47 +208,39 @@ public:
     }
 
     /// Work just sent writes [begin, end) of the GPU address space `space` (a memory manager).
-    void NoteMemoryWrite(const void* space, u64 begin, u64 end) {
+    /// `opaque`: the front does not know the data written.
+    void NoteMemoryWrite(const void* space, u64 begin, u64 end, bool opaque = true) {
         if (end <= begin) {
             return;
         }
-        const u64 first = begin >> WriteBlockShift;
-        const u64 last = (end - 1) >> WriteBlockShift;
-        if (last - first >= MaxWriteBlocks) {
+        if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
             NoteMemoryBarrier(0x40001);
             return;
         }
         if (write_blocks.size() >= 8192 && Consumed() >= latest_block_write) {
             write_blocks.clear();
+            opaque_blocks.clear();
         }
         if (write_blocks.size() >= 65536) {
             write_blocks.clear();
+            opaque_blocks.clear();
             NoteMemoryBarrier(0x40000);
         }
-        for (u64 block = first; block <= last; ++block) {
-            write_blocks[WriteBlockKey(space, block)] = write_position;
-        }
+        NoteBlocks(write_blocks, space, begin, end);
         latest_block_write = write_position;
+        if (opaque) {
+            NoteBlocks(opaque_blocks, space, begin, end);
+            latest_opaque_write = write_position;
+        }
     }
     /// The position the back must reach before [begin, end) of `space` can be read: the last
     /// untracked write, or the last queued write that overlaps it.
     [[nodiscard]] u64 ReadReadyPosition(const void* space, u64 begin, u64 end) {
-        u64 target = MemoryBarrierPosition();
-        if (end <= begin || write_blocks.empty() || latest_block_write <= target) {
-            return target;
-        }
-        const u64 first = begin >> WriteBlockShift;
-        const u64 last = (end - 1) >> WriteBlockShift;
-        if (last - first >= MaxWriteBlocks) {
-            return std::max(target, latest_block_write);
-        }
-        for (u64 block = first; block <= last; ++block) {
-            if (const auto it = write_blocks.find(WriteBlockKey(space, block));
-                it != write_blocks.end()) {
-                target = std::max(target, it->second);
-            }
-        }
-        return target;
+        return ReadyPosition(write_blocks, latest_block_write, space, begin, end);
+    }
+    /// As ReadReadyPosition, for writes whose data the front does not know.
+    [[nodiscard]] u64 OpaqueReadyPosition(const void* space, u64 begin, u64 end) {
+        return ReadyPosition(opaque_blocks, latest_opaque_write, space, begin, end);
     }
 
 private:
@@ -319,7 +311,32 @@ private:
         return block ^ (static_cast<u64>(reinterpret_cast<uintptr_t>(space)) << 40);
     }
     std::unordered_map<u64, u64> write_blocks;
+    std::unordered_map<u64, u64> opaque_blocks;
     u64 latest_block_write{};
+    u64 latest_opaque_write{};
+    void NoteBlocks(std::unordered_map<u64, u64>& blocks, const void* space, u64 begin, u64 end) {
+        for (u64 block = begin >> WriteBlockShift; block <= (end - 1) >> WriteBlockShift; ++block) {
+            blocks[WriteBlockKey(space, block)] = write_position;
+        }
+    }
+    u64 ReadyPosition(const std::unordered_map<u64, u64>& blocks, u64 latest, const void* space,
+                      u64 begin, u64 end) {
+        u64 target = MemoryBarrierPosition();
+        if (end <= begin || blocks.empty() || latest <= target) {
+            return target;
+        }
+        const u64 first = begin >> WriteBlockShift;
+        const u64 last = (end - 1) >> WriteBlockShift;
+        if (last - first >= MaxWriteBlocks) {
+            return std::max(target, latest);
+        }
+        for (u64 block = first; block <= last; ++block) {
+            if (const auto it = blocks.find(WriteBlockKey(space, block)); it != blocks.end()) {
+                target = std::max(target, it->second);
+            }
+        }
+        return target;
+    }
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};

@@ -868,6 +868,12 @@ struct Maxwell3D::FrontState {
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     u32 dma_reads{};
+    /// Constant buffer words sent inline: value and the ring position after the upload.
+    struct ShadowWord {
+        u32 value;
+        u64 position;
+    };
+    std::unordered_map<GPUVAddr, ShadowWord> cb_shadow;
     /// The inline-to-memory upload being sent writes [upload_begin, upload_end).
     bool upload_tracked{};
     GPUVAddr upload_begin{};
@@ -1022,12 +1028,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         split.Method(this, method, argument, is_last_call, nullptr);
     }
     if (execution_mask[method]) {
-        FrontNoteWrites(split, fs, method, 1);
+        FrontNoteWrites(split, fs, method, 1, &argument);
     }
 }
 
 void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
-                                u32 amount) {
+                                u32 amount, const u32* values) {
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto covers = [method, amount](u32 index) {
         return method <= index && index < method + amount;
@@ -1036,7 +1042,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         return (GPUVAddr{fs.regs[high]} << 32) | fs.regs[low];
     };
     const auto note = [&split, this](GPUVAddr begin, GPUVAddr end) {
-        split.NoteMemoryWrite(&memory_manager, begin, end);
+        split.NoteMemoryWrite(&memory_manager, begin, end, true);
     };
     if (method >= cb_data && method < cb_data + 16) {
         const GPUVAddr base = address(MAXWELL3D_REG_INDEX(const_buffer.address_high),
@@ -1047,7 +1053,20 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             split.NoteMemoryBarrier(0x30001);
             return;
         }
-        note(base + offset_end - bytes, base + offset_end);
+        const GPUVAddr begin = base + offset_end - bytes;
+        split.NoteMemoryWrite(&memory_manager, begin, base + offset_end, false);
+        // The words themselves, for MME DMA reads of them while the back has not written them.
+        if (fs.cb_shadow.size() >= 16384) {
+            const u64 done = split.Consumed();
+            std::erase_if(fs.cb_shadow, [done](const auto& entry) { return entry.second.position <= done; });
+            if (fs.cb_shadow.size() >= 16384) {
+                fs.cb_shadow.clear();
+            }
+        }
+        const u64 position = split.Position();
+        for (u32 i = 0; i < amount; ++i) {
+            fs.cb_shadow[begin + u64{i} * sizeof(u32)] = {values[i], position};
+        }
         return;
     }
     if (covers(MAXWELL3D_REG_INDEX(launch_dma))) {
@@ -1186,7 +1205,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
-    FrontNoteWrites(split, fs, method, amount);
+    FrontNoteWrites(split, fs, method, amount, base_start);
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1269,15 +1288,39 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                          !Tegra::Nx2CmdPageDiag::g_enabled &&
                          fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] == 0 &&
                          (++fs.dma_reads & 4095) != 0;
+    static thread_local std::vector<u32> shadow_words;
+    shadow_words.clear();
     if (precise) {
         const u64 target = split.ReadReadyPosition(&memory_manager, source, source + read_bytes);
         const u64 consumed = split.Consumed();
+        // Constant buffer words sent inline after any other write to them are known here:
+        // read them without waiting for the back to store them (EDEN_NX2_MME_DMA_SHADOW=0: wait).
+        static const bool shadow_enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_DMA_SHADOW");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (target > consumed && shadow_enabled) {
+            const u64 opaque =
+                split.OpaqueReadyPosition(&memory_manager, source, source + read_bytes);
+            shadow_words.clear();
+            for (u32 i = 0; i < words; ++i) {
+                const auto it = fs.cb_shadow.find(source + u64{i} * sizeof(u32));
+                // Only words still queued: memory has the others, maybe rewritten by the CPU.
+                if (it == fs.cb_shadow.end() || it->second.position < opaque ||
+                    it->second.position <= consumed) {
+                    shadow_words.clear();
+                    break;
+                }
+                shadow_words.push_back(it->second.value);
+            }
+        }
+        const bool from_shadow = !shadow_words.empty();
         // EDEN_NX2_MME_DMA_STATS: why precise reads wait (writer = compute or copy work).
         if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr; stats) {
             static std::array<u64, 4> causes{};
             const u64 writer = split.WriterPosition();
             const u64 barrier = split.MemoryBarrierPosition();
-            const size_t cause = target <= consumed ? 0
+            const size_t cause = target <= consumed || from_shadow ? 0
                                  : target == writer ? 1
                                  : target == barrier ? 2
                                                      : 3;
@@ -1294,7 +1337,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 }
             }
         }
-        if (target > consumed) {
+        if (target > consumed && !from_shadow) {
             split.WaitForPosition(target, VideoCommon::DrainSite::MacroDmaRead);
         }
     } else {
@@ -1330,7 +1373,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     u32 changed{};
     for (u32 i = 0; i < words; ++i) {
-        const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        const u32 word = !shadow_words.empty()
+                             ? shadow_words[i]
+                             : memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
