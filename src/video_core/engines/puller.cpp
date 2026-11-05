@@ -60,7 +60,7 @@ void OnBack(const Func& func) {
 
 // EDEN_NX2_MME_DMA_STATS: how semaphore acquires end and how long they hold the front.
 struct AcquireStats {
-    enum Kind : size_t { Fast, Own, Learned, AfterWait, AfterDrain, Suspended, Count };
+    enum Kind : size_t { Fast, Own, Learned, AfterWait, AfterDrain, Suspended, Deferred, Count };
     std::array<u64, Count> counts{};
     u64 wait_ns{};
     u64 drain_ns{};
@@ -81,9 +81,10 @@ struct AcquireStats {
         last_log = now;
         LOG_INFO(HW_GPU,
                  "Acquires (5 s): fast {}, own release {}, learned {}, met after wait {} ({} ms), "
-                 "met after drain {} ({} ms), suspended {} ({} ms)",
+                 "met after drain {} ({} ms), suspended {} ({} ms), deferred {}",
                  counts[Fast], counts[Own], counts[Learned], counts[AfterWait], wait_ns / 1000000,
-                 counts[AfterDrain], drain_ns / 1000000, counts[Suspended], suspended_ns / 1000000);
+                 counts[AfterDrain], drain_ns / 1000000, counts[Suspended], suspended_ns / 1000000,
+                 counts[Deferred]);
         counts = {};
         wait_ns = drain_ns = suspended_ns = 0;
     }
@@ -126,6 +127,40 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        // No drain: the back checks the word in order (SendBackCheck) and GPU releases latch.
+        auto& acquire = *pending_acquire;
+        const u64 check = back_check.load(std::memory_order_acquire);
+        const bool checked = (check >> 1) == acquire.generation;
+        if (checked && acquire.learn) {
+            acquire.learn = false;
+            NoteGpuMet(acquire.address, (check & 1) != 0);
+        }
+        if ((checked && (check & 1) != 0) || Nx2SemaphoreWaiters::Get().Latched(this)) {
+            return true;
+        }
+        auto& memory = dma_pusher.memory_manager;
+        if (split.ReadReadyPosition(&memory, acquire.address, acquire.address + 4) >
+            acquire.check_position) {
+            SendBackCheck(dma_pusher);
+        }
+        // Memory is current once the last check ran (it flushes cached GPU data); before, only
+        // a greater-or-equal value can be trusted, as releases only raise it.
+        if (acquire.Matches(memory.Read<u32>(acquire.address)) &&
+            (static_cast<GpuSemaphoreOperation>(acquire.operation) ==
+                 GpuSemaphoreOperation::AcquireGequal ||
+             split.Consumed() >= acquire.check_position)) {
+            return true;
+        }
+        if (!acquire.reported &&
+            std::chrono::steady_clock::now() - acquire.since > std::chrono::seconds{2}) {
+            acquire.reported = true;
+            LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s",
+                        dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                        acquire.value, memory.Read<u32>(acquire.address));
+        }
+        return false;
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
@@ -159,6 +194,45 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     return false;
 }
 
+void Puller::SuspendDeferred(DmaPusher& dma_pusher, const PendingAcquire& acquire, bool learn) {
+    // Registered before the fences run, so a release among them that meets the value counts.
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+        Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+    }
+    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    pending_acquire = acquire;
+    pending_acquire->since = std::chrono::steady_clock::now();
+    pending_acquire->generation = ++acquire_generation;
+    pending_acquire->learn = learn;
+    SendBackCheck(dma_pusher);
+    if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Deferred);
+    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+}
+
+void Puller::SendBackCheck(DmaPusher& dma_pusher) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.Defer([this, memory = &dma_pusher.memory_manager, rasterizer = dma_pusher.rasterizer,
+                 acquire = *pending_acquire] {
+        if (const auto device = memory->GpuToCpuAddress(acquire.address);
+            device &&
+            rasterizer->MustFlushRegion(*device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+            rasterizer->FlushRegion(*device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+        const bool met = acquire.Matches(memory->Read<u32>(acquire.address));
+        back_check.store((u64{acquire.generation} << 1) | (met ? 1 : 0), std::memory_order_release);
+    });
+    pending_acquire->check_position = split.Position();
+    split.Publish();
+}
+
+void Puller::NoteGpuMet(GPUVAddr address, bool met) {
+    u32& count = gpu_met_acquires[address];
+    if (count != ~0U) {
+        count = met ? count + 1 : 0;
+    }
+}
+
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
         return false;
@@ -169,6 +243,9 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire) {
         if (auto* stats = AcquireStats::Get()) stats->suspended_ns += NsSince(pending_acquire->since);
         pending_acquire.reset();
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.NoteSync();
+        }
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
     }
@@ -397,15 +474,21 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     return;
                 }
             }
+            // EDEN_NX2_ACQUIRE_DEFER=0: wait for the back here, then drain before suspending.
+            static const bool defer = [] {
+                const char* value = std::getenv("EDEN_NX2_ACQUIRE_DEFER");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (defer) {
+                SuspendDeferred(dma_pusher, acquire, learn && queued_writer);
+                return;
+            }
             const auto wait_start = std::chrono::steady_clock::now();
             split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
             if (auto* stats = AcquireStats::Get()) stats->wait_ns += NsSince(wait_start);
             const bool met = acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
             if (learn && queued_writer) {
-                u32& count = gpu_met_acquires[acquire.address];
-                if (count != ~0U) {
-                    count = met ? count + 1 : 0;
-                }
+                NoteGpuMet(acquire.address, met);
             }
             if (met) {
                 if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterWait);

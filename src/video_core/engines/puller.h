@@ -82,6 +82,11 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        /// Split ring position of the last check of it sent to the back (SendBackCheck).
+        u64 check_position{};
+        u32 generation{};
+        /// Queued work may meet it: the first check counts toward gpu_met_acquires.
+        bool learn{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -152,6 +157,13 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    /// Suspends on `acquire` without waiting for the split's back; it checks the word in order.
+    void SuspendDeferred(DmaPusher& dma_pusher, const PendingAcquire& acquire, bool learn);
+    void SendBackCheck(DmaPusher& dma_pusher);
+    void NoteGpuMet(GPUVAddr address, bool met);
+    u32 acquire_generation{};
+    /// The back's last check of the pending acquire: generation << 1 | met.
+    std::atomic<u64> back_check{};
     /// Semaphore releases this channel queued for the split's back: payload and ring position.
     struct QueuedRelease {
         u32 payload;
