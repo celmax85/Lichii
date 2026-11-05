@@ -2759,6 +2759,33 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
     } else {
+        // EDEN_NX2_CLEAR_TRACE=1: why a target created by a clear is still uploaded.
+        static const bool clear_trace = std::getenv("EDEN_NX2_CLEAR_TRACE") != nullptr;
+        if (clear_trace && clearing_render_targets &&
+            True(new_image.flags & ImageFlagBits::CpuModified)) {
+            static u32 logged{};
+            if (logged < 64) {
+                ++logged;
+                const auto& regs = maxwell3d->regs;
+                LOG_INFO(HW_GPU,
+                         "Clear target upload {:#x}: format {} {}x{} type {} levels {} layers {} "
+                         "samples {} joins {} | clear RT {} RGBA {}{}{}{} Z {} S {} layer {} "
+                         "scissor {} ({},{})-({},{}) rt0 {:#x} {}x{} count {} zeta {} {:#x} {}x{}",
+                         gpu_addr, static_cast<u32>(new_info.format), new_info.size.width,
+                         new_info.size.height, static_cast<u32>(new_info.type),
+                         new_info.resources.levels, new_info.resources.layers,
+                         new_info.num_samples, join_copies_to_do.size(),
+                         u32{regs.clear_surface.RT}, u32{regs.clear_surface.R},
+                         u32{regs.clear_surface.G}, u32{regs.clear_surface.B},
+                         u32{regs.clear_surface.A}, u32{regs.clear_surface.Z},
+                         u32{regs.clear_surface.S}, u32{regs.clear_surface.layer},
+                         regs.clear_control.use_scissor, regs.scissor_test[0].min_x,
+                         regs.scissor_test[0].min_y, regs.scissor_test[0].max_x,
+                         regs.scissor_test[0].max_y, regs.rt[0].Address(), regs.rt[0].width,
+                         regs.rt[0].height, regs.rt_control.count, regs.zeta_enable,
+                         regs.zeta.Address(), regs.zeta_size.width, regs.zeta_size.height);
+            }
+        }
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
     }
