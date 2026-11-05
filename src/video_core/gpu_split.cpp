@@ -139,7 +139,8 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_barrier_position = 0;
-    pending_writes.clear();
+    write_blocks.clear();
+    latest_block_write = 0;
     last_sync_position = 0;
     published_local = 0;
     consumed_cache = 0;

@@ -11,6 +11,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -208,32 +209,43 @@ public:
 
     /// Work just sent writes [begin, end) of the GPU address space `space` (a memory manager).
     void NoteMemoryWrite(const void* space, u64 begin, u64 end) {
-        if (!pending_writes.empty()) {
-            PendingWrite& last = pending_writes.back();
-            if (last.space == space &&
-                (last.end == begin || (last.begin == begin && last.end == end))) {
-                last.end = end;
-                last.position = write_position;
-                return;
-            }
+        if (end <= begin) {
+            return;
         }
-        if (pending_writes.size() >= 256) {
-            PrunePendingWrites();
-            if (pending_writes.size() >= 256) {
-                pending_writes.clear();
-                NoteMemoryBarrier(0x40000);
-            }
+        const u64 first = begin >> WriteBlockShift;
+        const u64 last = (end - 1) >> WriteBlockShift;
+        if (last - first >= MaxWriteBlocks) {
+            NoteMemoryBarrier(0x40001);
+            return;
         }
-        pending_writes.push_back({space, begin, end, write_position});
+        if (write_blocks.size() >= 8192 && Consumed() >= latest_block_write) {
+            write_blocks.clear();
+        }
+        if (write_blocks.size() >= 65536) {
+            write_blocks.clear();
+            NoteMemoryBarrier(0x40000);
+        }
+        for (u64 block = first; block <= last; ++block) {
+            write_blocks[WriteBlockKey(space, block)] = write_position;
+        }
+        latest_block_write = write_position;
     }
     /// The position the back must reach before [begin, end) of `space` can be read: the last
     /// untracked write, or the last queued write that overlaps it.
     [[nodiscard]] u64 ReadReadyPosition(const void* space, u64 begin, u64 end) {
-        PrunePendingWrites();
         u64 target = MemoryBarrierPosition();
-        for (const PendingWrite& write : pending_writes) {
-            if (write.space == space && write.begin < end && begin < write.end) {
-                target = std::max(target, write.position);
+        if (end <= begin || write_blocks.empty() || latest_block_write <= target) {
+            return target;
+        }
+        const u64 first = begin >> WriteBlockShift;
+        const u64 last = (end - 1) >> WriteBlockShift;
+        if (last - first >= MaxWriteBlocks) {
+            return std::max(target, latest_block_write);
+        }
+        for (u64 block = first; block <= last; ++block) {
+            if (const auto it = write_blocks.find(WriteBlockKey(space, block));
+                it != write_blocks.end()) {
+                target = std::max(target, it->second);
             }
         }
         return target;
@@ -299,17 +311,15 @@ private:
     u64 last_writer_position{};
     u64 last_barrier_position{};
     u32 last_barrier_source{};
-    struct PendingWrite {
-        const void* space;
-        u64 begin;
-        u64 end;
-        u64 position;
-    };
-    std::vector<PendingWrite> pending_writes;
-    void PrunePendingWrites() {
-        const u64 done = Consumed();
-        std::erase_if(pending_writes, [done](const PendingWrite& write) { return write.position <= done; });
+    // Queued tracked writes: the ring position after the last write to each 64-byte block.
+    static constexpr u64 WriteBlockShift = 6;
+    static constexpr u64 MaxWriteBlocks = 1024;
+    static u64 WriteBlockKey(const void* space, u64 block) {
+        // Aliasing only makes a read wait for an unrelated write.
+        return block ^ (static_cast<u64>(reinterpret_cast<uintptr_t>(space)) << 40);
     }
+    std::unordered_map<u64, u64> write_blocks;
+    u64 latest_block_write{};
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};
