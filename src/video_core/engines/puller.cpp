@@ -300,9 +300,31 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         if (fast_acquire && split.Active()) {
             // Only queued work that writes the semaphore (or untracked writes) can change it.
-            split.WaitForPosition(split.ReadReadyPosition(&dma_pusher.memory_manager,
-                                                          acquire.address, acquire.address + 4),
-                                  VideoCommon::DrainSite::Acquire);
+            const u64 target = split.ReadReadyPosition(&dma_pusher.memory_manager, acquire.address,
+                                                       acquire.address + 4);
+            if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr; stats) {
+                static std::array<u64, 5> causes{};
+                const auto own = queued_releases.find(acquire.address);
+                const size_t cause = target <= split.Consumed()          ? 0
+                                     : target == split.WriterPosition() ? 1
+                                     : target == split.MemoryBarrierPosition() ? 2
+                                     : own != queued_releases.end()      ? 3
+                                                                         : 4;
+                ++causes[cause];
+                if (cause == 3 && causes[3] < 16) {
+                    LOG_INFO(HW_GPU, "Acquire op {} {:#x} at {:#x}: own release {:#x}",
+                             static_cast<u32>(op), acquire.value, acquire.address,
+                             own->second.payload);
+                }
+                if (((causes[0] + causes[1] + causes[2] + causes[3] + causes[4]) & 0x3fff) == 0) {
+                    LOG_INFO(HW_GPU,
+                             "Acquire waits: none {}, writer {}, barrier {} (source {:#x}), own "
+                             "release {}, other write {}",
+                             causes[0], causes[1], causes[2], split.MemoryBarrierSource(),
+                             causes[3], causes[4]);
+                }
+            }
+            split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
             if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
                 split.NoteSync();
                 return;

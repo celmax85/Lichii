@@ -1257,7 +1257,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // EDEN_NX2_MME_DMA_PRECISE=0: wait for everything queued before each read (the old way).
     // Otherwise wait only for queued work that may write the words: compute, copies, untracked
     // writes and overlapping inline constant buffer data. Ocarina of Time reads ~20,000 times a
-    // second; a full drain each time kept the two GPU threads waiting on each other. Every 256th
+    // second; a full drain each time kept the two GPU threads waiting on each other. Every 4096th
     // read still drains and checks for GPU-written data, which turns the precise reads off.
     static const bool precise_enabled = [] {
         const char* value = std::getenv("EDEN_NX2_MME_DMA_PRECISE");
@@ -1268,7 +1268,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                          !VideoCommon::QueryDma::TraceEnabled() &&
                          !Tegra::Nx2CmdPageDiag::g_enabled &&
                          fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] == 0 &&
-                         (++fs.dma_reads & 255) != 0;
+                         (++fs.dma_reads & 4095) != 0;
     if (precise) {
         const u64 target = split.ReadReadyPosition(&memory_manager, source, source + read_bytes);
         const u64 consumed = split.Consumed();
