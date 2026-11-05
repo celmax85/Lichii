@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1043,7 +1044,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         const u64 offset_end = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
         const u64 bytes = u64{amount} * sizeof(u32);
         if (offset_end < bytes) {
-            split.NoteMemoryBarrier();
+            split.NoteMemoryBarrier(0x30001);
             return;
         }
         note(base + offset_end - bytes, base + offset_end);
@@ -1064,14 +1065,14 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
                                       MAXWELL3D_REG_INDEX(upload.dest.address_low));
             fs.upload_end = fs.upload_begin + (std::max)(pitch, line_length) * (lines - 1) + line_length;
         } else {
-            split.NoteMemoryBarrier();
+            split.NoteMemoryBarrier(0x30002);
         }
     }
     if (covers(MAXWELL3D_REG_INDEX(inline_data))) {
         if (fs.upload_tracked) {
             note(fs.upload_begin, fs.upload_end);
         } else {
-            split.NoteMemoryBarrier();
+            split.NoteMemoryBarrier(0x30003);
         }
     }
     if (covers(MAXWELL3D_REG_INDEX(report_semaphore.query))) {
@@ -1281,9 +1282,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  : target == barrier ? 2
                                                      : 3;
             ++causes[cause];
+            static std::unordered_map<u32, u64> sources;
+            if (cause == 2) {
+                ++sources[split.MemoryBarrierSource()];
+            }
             if (((causes[0] + causes[1] + causes[2] + causes[3]) & 0xffff) == 0) {
                 LOG_INFO(HW_GPU, "MME DMA reads: no wait {}, writer {}, barrier {}, constant buffer {}",
                          causes[0], causes[1], causes[2], causes[3]);
+                for (const auto& [source, count] : sources) {
+                    LOG_INFO(HW_GPU, "MME DMA read barrier source {:#x}: {}", source, count);
+                }
             }
         }
         if (target > consumed) {

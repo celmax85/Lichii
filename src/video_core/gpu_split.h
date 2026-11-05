@@ -178,8 +178,13 @@ public:
     bool WaitForSync();
 
     /// Work that may write guest memory at addresses the front does not track was just sent.
-    void NoteMemoryBarrier() {
+    /// `source` names the sender for EDEN_NX2_MME_DMA_STATS.
+    void NoteMemoryBarrier(u32 source = 0) {
         last_barrier_position = write_position;
+        last_barrier_source = source;
+    }
+    [[nodiscard]] u32 MemoryBarrierSource() const {
+        return last_barrier_source;
     }
     /// Where the last untracked memory write (or compute and copy work) was sent.
     [[nodiscard]] u64 MemoryBarrierPosition() const {
@@ -216,7 +221,7 @@ public:
             PrunePendingWrites();
             if (pending_writes.size() >= 256) {
                 pending_writes.clear();
-                NoteMemoryBarrier();
+                NoteMemoryBarrier(0x40000);
             }
         }
         pending_writes.push_back({space, begin, end, write_position});
@@ -293,6 +298,7 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_barrier_position{};
+    u32 last_barrier_source{};
     struct PendingWrite {
         const void* space;
         u64 begin;

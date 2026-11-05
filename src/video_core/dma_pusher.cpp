@@ -482,7 +482,7 @@ void DmaPusher::CallMethod(u32 argument) {
             dma_state.method_count,
         });
         if (PullerMethodWritesMemory(dma_state.method)) {
-            split.NoteMemoryBarrier();
+            split.NoteMemoryBarrier(0x10000 | dma_state.method);
         }
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
@@ -500,7 +500,8 @@ void DmaPusher::CallMethod(u32 argument) {
             if (writer) {
                 split.NoteWriter();
             } else if (untracked_writes) {
-                split.NoteMemoryBarrier();
+                split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
+                                        (dma_state.method & 0xfff));
             }
         };
         if (split.Active()) {
@@ -549,7 +550,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
         for (u32 i = 0; i < num_methods; ++i) {
             if (PullerMethodWritesMemory(dma_state.method + (dma_state.non_incrementing ? 0 : i))) {
-                split.NoteMemoryBarrier();
+                split.NoteMemoryBarrier(0x10000 | dma_state.method);
                 break;
             }
         }
@@ -569,7 +570,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             if (writer) {
                 split.NoteWriter();
             } else if (untracked_writes) {
-                split.NoteMemoryBarrier();
+                split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
+                                        (dma_state.method & 0xfff));
             }
         };
         if (split.Active()) {
