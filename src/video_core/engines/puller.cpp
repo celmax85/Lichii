@@ -324,8 +324,46 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                              causes[3], causes[4]);
                 }
             }
+            // EDEN_NX2_ACQUIRE_LEARN=0: always wait. Otherwise an address queued GPU work met
+            // 8 times in a row (compute completion) is trusted to be met by the work before it;
+            // the back checks each skipped one and stops trusting the address if it was not.
+            static const bool learn = [] {
+                const char* value = std::getenv("EDEN_NX2_ACQUIRE_LEARN");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool queued_writer = target > split.Consumed() && target == split.WriterPosition();
+            if (learn && has_unmet_acquires.exchange(false, std::memory_order_acquire)) {
+                std::scoped_lock lock{unmet_mutex};
+                for (const GPUVAddr unmet : unmet_acquires) {
+                    gpu_met_acquires[unmet] = ~0U;
+                    LOG_WARNING(HW_GPU, "Acquire at {:#x} was not met by the GPU work before it",
+                                unmet);
+                }
+                unmet_acquires.clear();
+            }
+            if (learn && queued_writer) {
+                const auto it = gpu_met_acquires.find(acquire.address);
+                if (it != gpu_met_acquires.end() && it->second >= 8 && it->second != ~0U) {
+                    split.Defer([this, memory = &dma_pusher.memory_manager, acquire_check = acquire] {
+                        if (!acquire_check.Matches(memory->Read<u32>(acquire_check.address))) {
+                            std::scoped_lock lock{unmet_mutex};
+                            unmet_acquires.push_back(acquire_check.address);
+                            has_unmet_acquires.store(true, std::memory_order_release);
+                        }
+                    });
+                    split.NoteSync();
+                    return;
+                }
+            }
             split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
-            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            const bool met = acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
+            if (learn && queued_writer) {
+                u32& count = gpu_met_acquires[acquire.address];
+                if (count != ~0U) {
+                    count = met ? count + 1 : 0;
+                }
+            }
+            if (met) {
                 split.NoteSync();
                 return;
             }

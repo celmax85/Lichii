@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstddef>
 #include <optional>
@@ -157,6 +159,12 @@ private:
     };
     std::unordered_map<GPUVAddr, QueuedRelease> queued_releases;
     void NoteRelease(GPUVAddr address, u32 payload);
+    /// Acquires at an address that queued GPU work met each time: how often in a row, or ~0U
+    /// once the back found one unmet after skipping its wait.
+    std::unordered_map<GPUVAddr, u32> gpu_met_acquires;
+    std::mutex unmet_mutex;
+    std::vector<GPUVAddr> unmet_acquires;
+    std::atomic<bool> has_unmet_acquires{false};
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};
