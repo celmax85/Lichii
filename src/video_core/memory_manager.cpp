@@ -625,7 +625,40 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
         entry.serial == serial) {
         return entry.result;
     }
-    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+    // Exact queries alone miss most of the time: Ocarina of Time binds ~100,000 storage buffers a
+    // second at varying addresses, and the uncached walk was 11% of the GPU back thread. Remember
+    // device-contiguous runs instead: any query starting inside one is answered from it.
+    struct Run {
+        size_t owner;
+        u64 serial;
+        GPUVAddr begin;
+        GPUVAddr end;
+        bool end_is_break; ///< The mapping stops being contiguous at end (not just unscanned).
+    };
+    thread_local std::array<Run, 32> runs{};
+    thread_local u32 next_run{};
+    const GPUVAddr query_end = gpu_addr + size;
+    for (const Run& run : runs) {
+        if (run.owner != unique_identifier + 1 || run.serial != serial || gpu_addr < run.begin ||
+            gpu_addr >= run.end) {
+            continue;
+        }
+        if (query_end <= run.end || run.end_is_break) {
+            const size_t result = static_cast<size_t>((std::min)(query_end, run.end) - gpu_addr);
+            entry = {unique_identifier + 1, gpu_addr, size, serial, result};
+            return result;
+        }
+    }
+    // Scan past the query so the run also answers its neighbours.
+    constexpr size_t ProbeSize = size_t{16} << 20;
+    const size_t probe =
+        size < ProbeSize && IsWithinGPUAddressRange(gpu_addr + ProbeSize) ? ProbeSize : size;
+    const size_t scanned = MaxContinuousRangeUncached(gpu_addr, probe);
+    const size_t result = (std::min)(scanned, size);
+    if (scanned != 0) {
+        runs[next_run++ % runs.size()] = {unique_identifier + 1, serial, gpu_addr,
+                                          gpu_addr + scanned, scanned < probe};
+    }
     entry = {unique_identifier + 1, gpu_addr, size, serial, result};
     return result;
 }
