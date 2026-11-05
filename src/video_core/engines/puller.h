@@ -162,6 +162,9 @@ private:
     /// Acquires at an address that queued GPU work met each time: how often in a row, or ~0U
     /// once the back found one unmet after skipping its wait.
     std::unordered_map<GPUVAddr, u32> gpu_met_acquires;
+    /// Suspended acquires at an address that a GPU release (Nx2SemaphoreWaiters latch) ended:
+    /// how often in a row, or ~0U once one ended otherwise or a skipped one was not met.
+    std::unordered_map<GPUVAddr, u32> gpu_released_acquires;
     std::mutex unmet_mutex;
     std::vector<GPUVAddr> unmet_acquires;
     std::atomic<bool> has_unmet_acquires{false};

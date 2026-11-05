@@ -60,7 +60,7 @@ void OnBack(const Func& func) {
 
 // EDEN_NX2_MME_DMA_STATS: how semaphore acquires end and how long they hold the front.
 struct AcquireStats {
-    enum Kind : size_t { Fast, Own, Learned, AfterWait, AfterDrain, Suspended, Count };
+    enum Kind : size_t { Fast, Own, Learned, AfterWait, AfterDrain, Suspended, GpuSkip, Count };
     std::array<u64, Count> counts{};
     u64 wait_ns{};
     u64 drain_ns{};
@@ -81,9 +81,10 @@ struct AcquireStats {
         last_log = now;
         LOG_INFO(HW_GPU,
                  "Acquires (5 s): fast {}, own release {}, learned {}, met after wait {} ({} ms), "
-                 "met after drain {} ({} ms), suspended {} ({} ms)",
+                 "met after drain {} ({} ms), suspended {} ({} ms), GPU-released skipped {}",
                  counts[Fast], counts[Own], counts[Learned], counts[AfterWait], wait_ns / 1000000,
-                 counts[AfterDrain], drain_ns / 1000000, counts[Suspended], suspended_ns / 1000000);
+                 counts[AfterDrain], drain_ns / 1000000, counts[Suspended], suspended_ns / 1000000,
+                 counts[GpuSkip]);
         counts = {};
         wait_ns = drain_ns = suspended_ns = 0;
     }
@@ -168,6 +169,10 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
         if (auto* stats = AcquireStats::Get()) stats->suspended_ns += NsSince(pending_acquire->since);
+        u32& released = gpu_released_acquires[pending_acquire->address];
+        if (released != ~0U) {
+            released = Nx2SemaphoreWaiters::Get().Latched(this) ? released + 1 : ~0U;
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -312,6 +317,15 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (has_unmet_acquires.exchange(false, std::memory_order_acquire)) {
+            std::scoped_lock lock{unmet_mutex};
+            for (const GPUVAddr unmet : unmet_acquires) {
+                gpu_met_acquires[unmet] = ~0U;
+                gpu_released_acquires[unmet] = ~0U;
+                LOG_WARNING(HW_GPU, "Acquire at {:#x} was not met by the GPU work before it", unmet);
+            }
+            unmet_acquires.clear();
+        }
         // A greater-or-equal acquire whose value is already in guest memory is met: releases only
         // raise the value, and one still queued for the back (or held in its caches) is newer.
         // Skip draining the back for it (~8% of the front in Ocarina of Time); later command
@@ -372,15 +386,6 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 return value == nullptr || value[0] != '0';
             }();
             const bool queued_writer = target > split.Consumed() && target == split.WriterPosition();
-            if (learn && has_unmet_acquires.exchange(false, std::memory_order_acquire)) {
-                std::scoped_lock lock{unmet_mutex};
-                for (const GPUVAddr unmet : unmet_acquires) {
-                    gpu_met_acquires[unmet] = ~0U;
-                    LOG_WARNING(HW_GPU, "Acquire at {:#x} was not met by the GPU work before it",
-                                unmet);
-                }
-                unmet_acquires.clear();
-            }
             if (learn && queued_writer) {
                 const auto it = gpu_met_acquires.find(acquire.address);
                 if (it != gpu_met_acquires.end() && it->second >= 8 && it->second != ~0U) {
@@ -427,6 +432,33 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         ReleaseFences(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            // EDEN_NX2_ACQUIRE_GPU_SKIP=0: always suspend. An address only GPU work released the
+            // last 8 times (compute completion) is not waited for: the GPU runs what follows in
+            // order anyway, and the front's own reads of GPU-written memory wait for it. Checked
+            // once the GPU reaches this point; one miss stops it for the address.
+            static const bool gpu_skip = [] {
+                const char* value = std::getenv("EDEN_NX2_ACQUIRE_GPU_SKIP");
+                return value == nullptr || value[0] != '0';
+            }();
+            auto& split = VideoCommon::GpuSplit::Get();
+            if (const auto it = gpu_released_acquires.find(acquire.address);
+                gpu_skip && split.Active() && it != gpu_released_acquires.end() &&
+                it->second >= 8 && it->second != ~0U) {
+                waiters.Remove(this);
+                split.Defer([this, rasterizer = dma_pusher.rasterizer,
+                             memory = &dma_pusher.memory_manager, acquire_check = acquire] {
+                    rasterizer->SignalFence([this, memory, acquire_check] {
+                        if (!acquire_check.Matches(memory->Read<u32>(acquire_check.address))) {
+                            std::scoped_lock lock{unmet_mutex};
+                            unmet_acquires.push_back(acquire_check.address);
+                            has_unmet_acquires.store(true, std::memory_order_release);
+                        }
+                    });
+                });
+                if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::GpuSkip);
+                split.NoteSync();
+                return;
+            }
             pending_acquire = acquire;
             pending_acquire->since = std::chrono::steady_clock::now();
             if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Suspended);
