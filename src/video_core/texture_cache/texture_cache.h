@@ -14,6 +14,7 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -2138,7 +2139,36 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
                         raw_config.raw[0], raw_config.raw[1], raw_config.raw[2], raw_config.raw[3]);
         }
     }
-    const TICEntry config = TextureViewHeader(raw_config, native);
+    TICEntry config = TextureViewHeader(raw_config, native);
+    // EDEN_NX2_TIC_LOD_TRACE=1: headers that limit their mip levels or are sparse.
+    static const bool lod_trace = std::getenv("EDEN_NX2_TIC_LOD_TRACE") != nullptr;
+    if (lod_trace && (config.min_lod_clamp != 0 || config.res_min_mip_level != 0 ||
+                      config.is_sparse != 0)) {
+        static std::unordered_set<GPUVAddr> traced;
+        if (traced.size() < 2000 && traced.insert(config.Address()).second) {
+            LOG_INFO(HW_GPU,
+                     "TIC LOD: image={:#x} {}x{}x{} format={} type={} mips={} res_mips={}-{} "
+                     "min_lod_clamp={:.3f} sparse={} lod_bias_raw={}",
+                     config.Address(), config.Width(), config.Height(), config.Depth(),
+                     static_cast<u32>(config.format.Value()),
+                     static_cast<u32>(config.texture_type.Value()), config.max_mip_level.Value(),
+                     config.res_min_mip_level.Value(), config.res_max_mip_level.Value(),
+                     static_cast<float>(config.min_lod_clamp.Value()) / 256.0f,
+                     config.is_sparse.Value(), config.mip_lod_bias.Value());
+        }
+    }
+    // EDEN_NX2_TIC_MIN_LOD=1: honour the header's minimum LOD clamp (4.8 fixed point) by starting
+    // the view at that level. Games streaming mips in leave the finer levels unloaded and clamp
+    // sampling above them.
+    static const bool tic_min_lod = [] {
+        const char* value = std::getenv("EDEN_NX2_TIC_MIN_LOD");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (tic_min_lod && config.min_lod_clamp >= 256) {
+        const u32 res_max = config.res_max_mip_level;
+        const u32 base = (std::min)(res_max, config.res_min_mip_level + (config.min_lod_clamp >> 8));
+        config.res_min_mip_level.Assign(base);
+    }
     const ImageInfo info(config);
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
