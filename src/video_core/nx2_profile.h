@@ -64,6 +64,7 @@ enum class Zone : u32 {
     ListGpuWait,
     Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) == 10);
 
 inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_names{
     "other",         "idle",          "pending sleep",  "resume pending", "push",
@@ -161,7 +162,6 @@ enum class Counter : u32 {
     PtrCacheMisses, ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page looked up
     Count,
 };
-static_assert(static_cast<size_t>(Counter::Count) == 10);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
 /// same-value writes among them; MME DMA reads by the macro that made them. The most frequent
