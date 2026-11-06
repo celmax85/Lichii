@@ -1308,9 +1308,6 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
-    if (amount != 0) {
-        FrontTrackInstanceLoop(fs, method, base_start[amount - 1]);
-    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1440,7 +1437,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     }
 }
 
-void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
+bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(draw.begin):
         // Instance id, bits 27:26: First leaves an instance loop, Subsequent enters one.
@@ -1449,20 +1446,12 @@ void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
         } else if (((value >> 26) & 3) == 1) {
             fs.instance_loop = true;
         }
-        break;
+        return false;
     case MAXWELL3D_REG_INDEX(draw_inline_index):
     case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
     case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
         fs.instance_loop = false; // DrawMode::InlineIndex: draw.end draws
-        break;
-    default:
-        break;
-    }
-}
-
-bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
-    FrontTrackInstanceLoop(fs, method, value);
-    switch (method) {
+        return false;
     case MAXWELL3D_REG_INDEX(draw.end):
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
     case MAXWELL3D_REG_INDEX(vertex_buffer.count):
