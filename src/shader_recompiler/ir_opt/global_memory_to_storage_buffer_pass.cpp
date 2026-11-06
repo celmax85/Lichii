@@ -1495,6 +1495,10 @@ small_vector<NativeIndirectSlot, 4> PointerRecords(IR::Inst& load, Environment& 
     };
     small_vector<Pending, 16> pending{{addr->value.InstRecursive(), addr->imm_offset}};
     std::unordered_set<const IR::Inst*> visited{pending.front().inst};
+    // A record whose high word also makes the address is a pointer even while it is unmapped
+    // (null when the pipeline was built): the binding reads it again for every draw or dispatch.
+    StorageBufferSet high_words;
+    ForEachSummedWord(addr->high, [&](StorageBufferAddr word, u32) { high_words.insert(word); });
     const auto add = [&](u32 index, u32 slot, s64 offset) {
         if (offset < 0 || offset >= 0x10000 || !Common::IsAligned(offset, 4)) {
             return;
@@ -1513,7 +1517,8 @@ small_vector<NativeIndirectSlot, 4> PointerRecords(IR::Inst& load, Environment& 
         }
         if (cbuf_offset.IsImmediate()) {
             if (Common::IsAligned(cbuf_offset.U32(), 8) &&
-                env.IsCbufStorageBufferPointer(index.U32(), cbuf_offset.U32())) {
+                (high_words.contains({.index = index.U32(), .offset = cbuf_offset.U32() + 4}) ||
+                 env.IsCbufStorageBufferPointer(index.U32(), cbuf_offset.U32()))) {
                 add(index.U32(), cbuf_offset.U32(), offset);
             }
         } else if (NativeDynamicCbufPointers()) {
@@ -1770,7 +1775,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         // and every access based on it: Bananza's append counters and the records stored after
         // them were unmapped when their pipelines were first built. The binding reads the pointer
         // again for every dispatch.
-        if (!paired_pointer || !info.atomic_pointers.contains(*paired_pointer)) {
+        // With EDEN_NX2_INDIRECT_POINTERS, so does any pointer whose low and high words both make
+        // the address: Ocarina of Time's vegetation task program 48823ab9 reads c0[0x690]'s
+        // buffer, null when its pipeline was built, and those loads stayed global (reading zero).
+        const bool keep_unmapped{paired_pointer && (info.atomic_pointers.contains(*paired_pointer) ||
+                                                    IndirectPointerStage(env.ShaderStage()))};
+        if (!keep_unmapped) {
             CountUntracked(inst, info, env);
             return;
         }
