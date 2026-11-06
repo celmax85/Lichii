@@ -1548,12 +1548,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     }
-    // EDEN_NX2_QUERY_DMA_FLUSH=1: a read of a page reports were sent to writes out the reports
-    // the query cache still holds, waiting for their host results (Lichii #215), or the guest
-    // reads stale occlusion counts.
+    // A read of a page reports were sent to writes out the reports the query cache still holds,
+    // waiting for their host results (Lichii #215), or the guest reads stale occlusion counts
+    // (white flashes). EDEN_NX2_QUERY_DMA_FLUSH=0 turns it off.
     static const bool query_flush = [] {
         const char* value = std::getenv("EDEN_NX2_QUERY_DMA_FLUSH");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     const bool reads_reports = [&] {
         if (!query_flush || !shadow_words.empty() || words == 0) {
