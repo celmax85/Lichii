@@ -1362,12 +1362,20 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     }();
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
-    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // the memory tracker, leaving stale host contents, so check such a bank again. Ocarina of Time
+    // rewrites per-draw material data between draws, so once per frame left it stale for a frame
+    // now and then (white flashes, Eglantine 031e07436c). EDEN_NX2_BANK_REUPLOAD: 1 once per
+    // frame, 2 every bind (default).
+    static const bool bank_every_bind = [] {
+        const char* value = std::getenv("EDEN_NX2_BANK_REUPLOAD");
+        return value == nullptr || value[0] != '1';
+    }();
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
-        (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
+        (bank_every_bind || Nx2Perf::Verify() ||
+         !native_indirect_uniforms_this_frame.contains(device_addr)) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
-        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        (bank_every_bind || native_indirect_uniforms_this_frame.insert(device_addr).second)) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -1393,7 +1401,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
             const DAddr end = device_addr + check_size;
             for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
-                if (!native_indirect_pages_this_frame.insert(page).second) {
+                if (!bank_every_bind && !native_indirect_pages_this_frame.insert(page).second) {
                     continue;
                 }
                 const u8* const guest = device_memory.template GetPointer<u8>(page);
