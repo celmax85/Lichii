@@ -298,7 +298,14 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    return !has_unbound_instructions && (!lowered_native || lowered_native->trap_prefix.empty());
+    // EDEN_NX2_SERIALIZE_TRAP_GUARDED=0: keep programs with trap guards out of the disk cache.
+    // Stored, they no longer rebuild on the GPU thread at every boot (Lichii #192, #225).
+    static const bool serialize_guarded = [] {
+        const char* value = std::getenv("EDEN_NX2_SERIALIZE_TRAP_GUARDED");
+        return value == nullptr || value[0] != '0';
+    }();
+    return !has_unbound_instructions &&
+           (serialize_guarded || !lowered_native || lowered_native->trap_prefix.empty());
 }
 
 bool GenericEnvironment::HasNativeInstructions() const {
