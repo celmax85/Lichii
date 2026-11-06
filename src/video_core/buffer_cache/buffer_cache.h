@@ -1407,10 +1407,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
                     stats) {
                     static std::array<u64, 3> counts{};
+                    static std::array<u64, 4> changed_state{};
                     ++counts[same ? 0 : (inserted ? 1 : 2)];
+                    if (!same && !inserted) {
+                        // Did the tracker already know (CPU-modified), or was the page clean, and
+                        // was it GPU-modified?
+                        const bool known =
+                            memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE);
+                        const bool gpu =
+                            memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE);
+                        ++changed_state[(known ? 1 : 0) | (gpu ? 2 : 0)];
+                    }
                     if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
-                        LOG_INFO(HW_GPU, "Native bank pages checked: same {}, new {}, changed {}",
-                                 counts[0], counts[1], counts[2]);
+                        LOG_INFO(HW_GPU,
+                                 "Native bank pages checked: same {}, new {}, changed {} (tracker "
+                                 "clean {}, CPU-modified {}, GPU {}, both {})",
+                                 counts[0], counts[1], counts[2], changed_state[0],
+                                 changed_state[1], changed_state[2], changed_state[3]);
                     }
                 }
                 if (same) {
