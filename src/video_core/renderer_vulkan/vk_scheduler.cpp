@@ -855,6 +855,7 @@ void Scheduler::EndPendingOperations() {
     EndRenderPass();
 }
 
+/// Finish the active render pass and invalidate recorded binds that do not survive it.
 void Scheduler::EndRenderPass()
     {
         RealizeDeferredClear();
@@ -864,6 +865,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        ++recording_epoch;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

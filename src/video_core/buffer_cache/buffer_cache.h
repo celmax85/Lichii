@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -113,6 +114,7 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
+    native_indirect_pages_this_frame.clear();
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -210,9 +212,14 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // structures next to the draw arguments its compute dispatches fill in; the draws then read
     // leftover bytes as vertex counts. Download those bytes first (the CPU's own were subtracted
     // above, so they aren't overwritten).
+    // Only the scheduler's owner may download (it records and submits): unmaps and other writes
+    // reach this from CPU and service threads too, and submitting there raced the GPU thread's
+    // own submissions (crashes in Scheduler::SubmitExecution). Those keep the old behaviour;
+    // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && VideoCommon::GpuSplit::OwnsScheduler() &&
+        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
         static const int forced = [] {
@@ -1367,14 +1374,51 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
-        const u64 upload_size = (std::min<u64>)(mapped_size, size);
-        if (upload_size != 0) {
-            std::array<BufferCopy, 1> copies{BufferCopy{
-                .src_offset = 0,
-                .dst_offset = buffer.Offset(device_addr),
-                .size = upload_size,
-            }};
-            UploadMemory(buffer, upload_size, upload_size, copies);
+        const u64 check_size = (std::min<u64>)(mapped_size, size);
+        // EDEN_NX2_BANK_SNAPSHOT=0: mark the bank modified every frame.
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_BANK_SNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!snapshot) {
+            if (check_size != 0) {
+                memory_tracker.MarkRegionAsCpuModified(device_addr, check_size);
+            }
+        } else {
+            // Banks slide through larger buffers, a new address per draw: check each page once a
+            // frame against its last contents and mark only the pages that changed.
+            if (native_indirect_page_snapshots.size() >= 16384) {
+                native_indirect_page_snapshots.clear();
+            }
+            const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+            const DAddr end = device_addr + check_size;
+            for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+                if (!native_indirect_pages_this_frame.insert(page).second) {
+                    continue;
+                }
+                const u8* const guest = device_memory.template GetPointer<u8>(page);
+                if (guest == nullptr) {
+                    continue;
+                }
+                auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+                const bool same =
+                    !inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+                // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
+                if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+                    stats) {
+                    static std::array<u64, 3> counts{};
+                    ++counts[same ? 0 : (inserted ? 1 : 2)];
+                    if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
+                        LOG_INFO(HW_GPU, "Native bank pages checked: same {}, new {}, changed {}",
+                                 counts[0], counts[1], counts[2]);
+                    }
+                }
+                if (same) {
+                    continue;
+                }
+                std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
+                memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            }
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
@@ -2461,6 +2505,8 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     }
 }
 
+/// Upload CPU-dirty pages in the range. A range with no pending CPU or
+/// untracked bits is already synchronized.
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
